@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.omx/
+.worktrees/
+.cargo-home/
+dist/
+build/
+output/
+scratch/
+tmp/

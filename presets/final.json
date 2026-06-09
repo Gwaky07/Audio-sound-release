@@ -1,0 +1,86 @@
+{
+  "name": "final",
+  "description": "Final spoken-word delivery preset with moderated breath and mouth-noise repair.",
+  "notes": [
+    "This is the delivery preset balancing cleanup audibility and reduced consonant damage.",
+    "It keeps click reduction and light sibilance control while avoiding the hardest dynamic shaping."
+  ],
+  "extract": {
+    "sample_rate": 48000,
+    "channels": 1,
+    "pcm_codec": "pcm_s16le"
+  },
+  "deepfilternet": {
+    "enabled": true,
+    "module": "df.enhance",
+    "post_filter": true
+  },
+  "filters": {
+    "highpass_hz": 72,
+    "lowpass_hz": 11200,
+    "declick": {
+      "enabled": true,
+      "window": 55,
+      "overlap": 75,
+      "arorder": 2,
+      "threshold": 2.4,
+      "burst": 2.1
+    },
+    "secondary_denoise": {
+      "enabled": true,
+      "nr": 12,
+      "nf": -25,
+      "tracking": true
+    },
+    "nonlinear_denoise": {
+      "enabled": false,
+      "strength": 0.03,
+      "patch": 0.002,
+      "research": 0.006,
+      "smooth": 11
+    },
+    "deesser": {
+      "enabled": true,
+      "intensity": 0.15,
+      "max_deessing": 0.5,
+      "frequency": 0.46
+    },
+    "gate": {
+      "enabled": true,
+      "threshold": 0.021,
+      "ratio": 2.5,
+      "attack_ms": 20,
+      "release_ms": 280,
+      "makeup_db": 1
+    },
+    "compressor": {
+      "enabled": true,
+      "threshold_db": -19,
+      "ratio": 2.0,
+      "attack_ms": 12,
+      "release_ms": 150,
+      "makeup_db": 2
+    },
+    "speech_norm": {
+      "enabled": false,
+      "expansion": 1.0,
+      "raise": 0.0008,
+      "fall": 0.0006,
+      "threshold": 0.0
+    },
+    "loudnorm": {
+      "target_i": -16.0,
+      "target_lra": 7.0,
+      "target_tp": -1.5
+    }
+  },
+  "analysis": {
+    "silence_candidates": false,
+    "silence_threshold_db": -38,
+    "silence_min_duration": 0.12
+  },
+  "transcript_export": {
+    "codec": "libmp3lame",
+    "bitrate": "192k"
+  }
+}

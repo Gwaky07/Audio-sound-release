@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audio-sound"
+version = "0.2.0"
+description = "Standalone Codex-triggered audio processing pipeline."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+audio-cleanup = "audio_sound.cli:main"
+
+[tool.setuptools]
+packages = ["audio_sound"]
