@@ -61,6 +61,16 @@ class CliTests(unittest.TestCase):
             cli.main(["process", "sample.wav"])
         command_clean.assert_called_once()
 
+    def test_clean_repo_dispatches_workspace_cleanup(self) -> None:
+        with mock.patch("audio_sound.cli.prune_workspace") as prune_workspace:
+            prune_workspace.return_value = {"dry_run": True, "removed_count": 0, "targets": []}
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = cli.main(["clean-repo", "--dry-run"])
+        self.assertEqual(exit_code, 0)
+        prune_workspace.assert_called_once()
+        self.assertIn('"dry_run": true', buffer.getvalue().lower())
+
 
 if __name__ == "__main__":
     unittest.main()

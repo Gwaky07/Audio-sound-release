@@ -117,3 +117,52 @@ def format_runtime_report(data: dict[str, Any]) -> str:
 
 def format_install_report(data: dict[str, Any]) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def prune_workspace(*, repo_root: str | Path, dry_run: bool = False) -> dict[str, Any]:
+    root = Path(repo_root)
+    top_level_dirs = [
+        root / "output",
+        root / "scratch",
+        root / ".venv",
+        root / ".pytest_cache",
+        root / ".omx",
+        root / ".worktrees",
+        root / ".cargo-home",
+    ]
+    top_level_targets = {path.resolve() for path in top_level_dirs if path.exists()}
+    removable_dirs = [
+        path.resolve()
+        for path in root.rglob("__pycache__")
+        if path.is_dir() and not any(parent in top_level_targets for parent in path.resolve().parents)
+    ]
+    removable_files = list(root.rglob("*.pyc"))
+    directory_targets = {path for path in removable_dirs if path.exists()} | top_level_targets
+    file_targets = {
+        path.resolve()
+        for path in removable_files
+        if path.exists() and not any(parent in directory_targets for parent in path.resolve().parents)
+    }
+    targets = sorted([*directory_targets, *file_targets], key=lambda item: str(item))
+
+    bytes_reclaimed = 0
+    for path in targets:
+        if path.is_file():
+            bytes_reclaimed += path.stat().st_size
+            if not dry_run:
+                path.unlink()
+            continue
+
+        for child in path.rglob("*"):
+            if child.is_file():
+                bytes_reclaimed += child.stat().st_size
+        if not dry_run:
+            shutil.rmtree(path)
+
+    return {
+        "dry_run": dry_run,
+        "removed_count": len(targets),
+        "bytes_reclaimed": bytes_reclaimed,
+        "targets": [str(path) for path in targets],
+        "top_level_targets": [str(path) for path in sorted(top_level_targets, key=lambda item: str(item))],
+    }

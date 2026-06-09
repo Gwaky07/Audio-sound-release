@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from .bootstrap import detect_runtime, format_install_report, format_runtime_report, run_install
+from .bootstrap import detect_runtime, format_install_report, format_runtime_report, prune_workspace, run_install
 from .config import PROJECT_ROOT, apply_runtime_overrides, list_presets, load_preset, resolve_repo_python
 from .pipeline import (
     NoiseWindow,
@@ -41,6 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_parser = subparsers.add_parser("setup", help="Install optional local runtime dependencies.")
     setup_parser.add_argument("--python-executable", default=resolve_repo_python(PROJECT_ROOT))
+
+    clean_repo_parser = subparsers.add_parser("clean-repo", help="Remove generated outputs and local runtime state from the repository.")
+    clean_repo_parser.add_argument("--dry-run", action="store_true")
 
     clean_parser = subparsers.add_parser("clean", help="Process one file or one directory.")
     _add_clean_arguments(clean_parser)
@@ -103,6 +106,12 @@ def command_setup(args: argparse.Namespace) -> int:
     payload = run_install(repo_root=PROJECT_ROOT, python_executable=args.python_executable)
     print(format_install_report(payload))
     return 0 if payload.get("ok") else 1
+
+
+def command_clean_repo(args: argparse.Namespace) -> int:
+    payload = prune_workspace(repo_root=PROJECT_ROOT, dry_run=args.dry_run)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
 
 
 def command_clean(args: argparse.Namespace) -> int:
@@ -184,6 +193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return command_doctor(args)
     if args.command == "setup":
         return command_setup(args)
+    if args.command == "clean-repo":
+        return command_clean_repo(args)
     if args.command in {"clean", "process"}:
         return command_clean(args)
 

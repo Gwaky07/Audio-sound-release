@@ -70,10 +70,28 @@ Install recommended local runtime packages:
 python scripts/audio_cleanup.py setup
 ```
 
+Remove generated outputs and local machine state from the repository:
+
+```bash
+python scripts/audio_cleanup.py clean-repo
+```
+
+Preview what would be removed first:
+
+```bash
+python scripts/audio_cleanup.py clean-repo --dry-run
+```
+
 Or on Windows, use the repo helper which creates `.venv` first:
 
 ```bash
 setup.cmd
+```
+
+To verify a clean checkout on Windows:
+
+```bash
+doctor.cmd
 ```
 
 Inspect one file:
@@ -157,6 +175,23 @@ Batch summary files are written at the run root:
 
 - `batch-summary.json`
 - `batch-summary.md`
+
+## Handoff
+
+For the cleanest shareable repository:
+
+1. Run `python scripts/audio_cleanup.py clean-repo --dry-run`
+2. Run `python scripts/audio_cleanup.py clean-repo`
+3. Share the repository without `.venv/`, `output/`, `scratch/`, `.omx/`, `.worktrees/`, or cache folders
+
+For the receiving machine:
+
+1. Install Python 3.10+, `ffmpeg`, and `ffprobe`
+2. Run `setup.cmd`
+3. Run `doctor.cmd`
+4. Keep source media outside the repository when possible, or use `scratch/` for temporary local work
+
+The repository is meant to stay source-only. Generated audio, reports, and temporary review files should remain under ignored working directories such as `output/` or `scratch/`.
 
 ## Codex usage
 
