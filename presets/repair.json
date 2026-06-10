@@ -5,15 +5,33 @@
     "Use when ordinary cleanup leaves breathing too forward or mouth noises too obvious.",
     "This preset is more interventionist than safe and should be judged by listening, not by waveform alone."
   ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.06,
+        "min_length_ms": 18
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.72,
+        "breath_control_sensitivity": 0.72,
+        "mouth_declick_sensitivity": 0.75
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
   "extract": {
     "sample_rate": 48000,
     "channels": 1,
     "pcm_codec": "pcm_s16le"
-  },
-  "deepfilternet": {
-    "enabled": true,
-    "module": "df.enhance",
-    "post_filter": true
   },
   "filters": {
     "highpass_hz": 75,
@@ -59,7 +77,7 @@
       "ratio": 2.4,
       "attack_ms": 10,
       "release_ms": 120,
-      "makeup_db": 2
+      "makeup_db": 1
     },
     "speech_norm": {
       "enabled": true,
@@ -69,9 +87,9 @@
       "threshold": 0.0
     },
     "loudnorm": {
-      "target_i": -16.0,
+      "target_i": -16.8,
       "target_lra": 7.0,
-      "target_tp": -1.5
+      "target_tp": -3.0
     }
   },
   "analysis": {

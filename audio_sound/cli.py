@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from .bootstrap import detect_runtime, format_install_report, format_runtime_report, run_install
-from .config import PROJECT_ROOT, apply_runtime_overrides, list_presets, load_preset, resolve_repo_python
+from .bootstrap import detect_runtime, format_install_report, format_runtime_report, run_install, run_respiro_setup
+from .config import PROJECT_ROOT, apply_runtime_overrides, list_presets, load_env_file, load_preset, resolve_repo_python
 from .pipeline import (
     NoiseWindow,
     RuntimeOptions,
@@ -16,9 +16,11 @@ from .pipeline import (
     ffprobe_media,
     parse_noise_window,
     process_media_file,
+    resolve_respiro_runtime,
     render_batch_summary_markdown,
     utc_timestamp_slug,
 )
+from .skill_workflow import describe_modes
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +44,15 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser = subparsers.add_parser("setup", help="Install optional local runtime dependencies.")
     setup_parser.add_argument("--python-executable", default=resolve_repo_python(PROJECT_ROOT))
 
+    setup_respiro_parser = subparsers.add_parser("setup-respiro", help="Clone Respiro-en and download weights locally.")
+    setup_respiro_parser.add_argument("--tools-dir", default=str(PROJECT_ROOT / "tools"))
+
+    describe_workflow_parser = subparsers.add_parser(
+        "describe-workflow-mode",
+        help="Print one repo-local stable workflow mode as JSON.",
+    )
+    describe_workflow_parser.add_argument("mode_name", nargs="?", choices=sorted(describe_modes().keys()))
+
     clean_parser = subparsers.add_parser("clean", help="Process one file or one directory.")
     _add_clean_arguments(clean_parser)
 
@@ -54,6 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_clean_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("input_path")
     parser.add_argument("--preset", default="safe", choices=list_presets())
+    parser.add_argument("--attenuation-db", type=float, default=18.0)
+    parser.add_argument("--respiro-threshold", type=float)
+    parser.add_argument("--respiro-min-length-ms", type=int)
+    parser.add_argument("--respiro-repo")
+    parser.add_argument("--respiro-weights")
+    parser.add_argument("--enable-legacy-breath-filters", action="store_true")
+    parser.add_argument("--skip-spectramini", action="store_true")
+    parser.add_argument("--skip-deepfilternet", action="store_true")
     parser.add_argument(
         "--noise-window",
         action="append",
@@ -105,6 +124,17 @@ def command_setup(args: argparse.Namespace) -> int:
     return 0 if payload.get("ok") else 1
 
 
+def command_setup_respiro(args: argparse.Namespace) -> int:
+    payload = run_respiro_setup(repo_root=PROJECT_ROOT, tools_dir=args.tools_dir)
+    print(format_install_report(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def command_describe_workflow_mode(mode_name: str | None) -> int:
+    print(json.dumps(describe_modes(mode_name), indent=2, ensure_ascii=False))
+    return 0
+
+
 def command_clean(args: argparse.Namespace) -> int:
     input_path = Path(args.input_path)
     files = discover_media_files(input_path, recursive=args.recursive)
@@ -119,6 +149,7 @@ def command_clean(args: argparse.Namespace) -> int:
         denoise_strength=args.denoise_strength,
         disable_gate=args.disable_gate,
         enable_silence_report=args.enable_silence_report,
+        enable_legacy_breath_filters=args.enable_legacy_breath_filters,
     )
 
     run_slug = utc_timestamp_slug()
@@ -134,6 +165,12 @@ def command_clean(args: argparse.Namespace) -> int:
         python_executable=args.python_executable,
         dry_run=args.dry_run,
     )
+    env_values = load_env_file(PROJECT_ROOT / ".env")
+    respiro_runtime = resolve_respiro_runtime(
+        respiro_repo=args.respiro_repo,
+        respiro_weights=args.respiro_weights,
+        env_values=env_values,
+    )
 
     reports = [
         process_media_file(
@@ -144,6 +181,13 @@ def command_clean(args: argparse.Namespace) -> int:
             runtime=runtime,
             run_slug=run_slug,
             noise_windows=noise_windows,
+            respiro_repo=respiro_runtime["repo_path"],
+            respiro_weights=respiro_runtime["weights_path"],
+            attenuation_db=args.attenuation_db,
+            respiro_threshold=args.respiro_threshold,
+            respiro_min_length_ms=args.respiro_min_length_ms,
+            skip_spectramini=args.skip_spectramini,
+            skip_deepfilternet=args.skip_deepfilternet,
         )
         for file_path in files
     ]
@@ -184,6 +228,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return command_doctor(args)
     if args.command == "setup":
         return command_setup(args)
+    if args.command == "setup-respiro":
+        return command_setup_respiro(args)
+    if args.command == "describe-workflow-mode":
+        return command_describe_workflow_mode(args.mode_name)
     if args.command in {"clean", "process"}:
         return command_clean(args)
 

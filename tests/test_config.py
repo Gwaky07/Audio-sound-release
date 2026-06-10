@@ -15,8 +15,10 @@ class ConfigTests(unittest.TestCase):
     def test_load_preset_returns_structured_sections(self) -> None:
         preset = load_preset("safe")
         self.assertEqual(preset["extract"]["sample_rate"], 48000)
-        self.assertTrue(preset["deepfilternet"]["enabled"])
-        self.assertEqual(preset["filters"]["loudnorm"]["target_i"], -16.0)
+        self.assertEqual(preset["pipeline"]["stages"][0]["type"], "respiro")
+        self.assertEqual(preset["filters"]["loudnorm"]["target_i"], -20.0)
+        self.assertEqual(preset["filters"]["loudnorm"]["target_tp"], -9.0)
+        self.assertTrue(preset["filters"]["pause_residual_cleanup"]["enabled"])
         self.assertEqual(preset["transcript_export"]["codec"], "libmp3lame")
 
     def test_apply_runtime_overrides_updates_nested_values(self) -> None:
@@ -32,6 +34,14 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(preset["filters"]["gate"]["enabled"])
         self.assertTrue(preset["analysis"]["silence_candidates"])
 
+    def test_apply_runtime_overrides_can_opt_into_legacy_breath_filters(self) -> None:
+        preset = apply_runtime_overrides(
+            load_preset("voice-isolate"),
+            enable_legacy_breath_filters=True,
+        )
+        self.assertTrue(preset["filters"]["breath_ducking"]["enabled"])
+        self.assertTrue(preset["filters"]["breath_onset_cleanup"]["enabled"])
+
     def test_load_env_file_parses_simple_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             env_path = Path(tmp_dir) / ".env"
@@ -41,6 +51,8 @@ class ConfigTests(unittest.TestCase):
                         "# comment",
                         "AUDIO_SOUND_FFMPEG=ffmpeg-custom",
                         "AUDIO_SOUND_PYTHON='python-custom'",
+                        "AUDIO_SOUND_RESPIRO_REPO='D:/models/Respiro-en'",
+                        "AUDIO_SOUND_RESPIRO_WEIGHTS='D:/models/respiro-en.pt'",
                     ]
                 ),
                 encoding="utf-8",
@@ -48,6 +60,8 @@ class ConfigTests(unittest.TestCase):
             values = load_env_file(env_path)
         self.assertEqual(values["AUDIO_SOUND_FFMPEG"], "ffmpeg-custom")
         self.assertEqual(values["AUDIO_SOUND_PYTHON"], "python-custom")
+        self.assertEqual(values["AUDIO_SOUND_RESPIRO_REPO"], "D:/models/Respiro-en")
+        self.assertEqual(values["AUDIO_SOUND_RESPIRO_WEIGHTS"], "D:/models/respiro-en.pt")
 
     def test_preset_files_remain_json_serializable(self) -> None:
         preset = load_preset("review")

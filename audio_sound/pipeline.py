@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
+import tempfile
 import wave
 from array import array
 from dataclasses import dataclass
@@ -29,6 +31,23 @@ SUPPORTED_MEDIA_EXTENSIONS = {
 JSON_BLOCK_PATTERN = re.compile(r"\{\s*\"input_i\".*?\}", re.DOTALL)
 SILENCE_START_PATTERN = re.compile(r"silence_start:\s*([0-9.]+)")
 SILENCE_END_PATTERN = re.compile(r"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)")
+DEFAULT_BREATH_FALLBACK_CONFIG = {
+    "low_threshold_db": -44,
+    "high_threshold_db": -32,
+    "silence_min_duration": 0.08,
+    "min_breath_ms": 70,
+    "max_breath_ms": 320,
+    "pre_roll_ms": 25,
+    "fade_ms": 14,
+    "floor_gain": 0.0,
+    "analysis_hop_ms": 18,
+    "analysis_scan_ms": 260,
+    "noise_floor_ms": 120,
+    "speech_start_ratio": 0.78,
+    "breath_over_noise_ratio": 2.6,
+    "speech_over_breath_ratio": 2.15,
+    "speech_confirm_frames": 2,
+}
 
 
 @dataclass
@@ -47,6 +66,20 @@ class NoiseWindow:
     end_seconds: float
 
 
+@dataclass
+class RespiroDetectionResult:
+    windows: list[NoiseWindow]
+    mode: str
+    assets_present: bool
+    attempted: bool
+    succeeded: bool
+    command: list[str] | None = None
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+
+
 @dataclass(frozen=True)
 class OutputLayout:
     job_name: str
@@ -63,6 +96,30 @@ class OutputLayout:
     deepfilternet_dir: Path
 
 
+def build_breath_processing_plan(
+    preset: dict[str, Any],
+    *,
+    attenuation_db: float,
+    skip_spectramini: bool,
+    skip_deepfilternet: bool,
+) -> list[dict[str, Any]]:
+    stages = preset.get("pipeline", {}).get("stages", [])
+    plan: list[dict[str, Any]] = []
+    for stage in stages:
+        stage_type = stage.get("type")
+        if not stage.get("enabled", True):
+            continue
+        if stage_type == "spectramini" and skip_spectramini:
+            continue
+        if stage_type == "deepfilternet" and skip_deepfilternet:
+            continue
+        resolved = dict(stage)
+        if stage_type == "respiro":
+            resolved["attenuation_db"] = float(attenuation_db)
+        plan.append(resolved)
+    return plan
+
+
 def utc_timestamp_slug() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
@@ -74,10 +131,343 @@ def build_output_root(base_dir: str | Path, run_slug: str) -> Path:
 def _slugify_stem(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip().lower())
     cleaned = re.sub(r"_+", "_", cleaned).strip("._")
-    if cleaned:
+    if cleaned and re.search(r"[A-Za-z0-9]", cleaned):
         return cleaned
     digest = sha1(value.encode("utf-8")).hexdigest()[:8]
     return f"media_{digest}"
+
+
+def get_pipeline_stage(preset: dict[str, Any], stage_type: str) -> dict[str, Any]:
+    for stage in preset.get("pipeline", {}).get("stages", []):
+        if stage.get("type") == stage_type:
+            return stage
+    raise KeyError(stage_type)
+
+
+def attenuation_db_to_gain(attenuation_db: float) -> float:
+    return 10 ** (-float(attenuation_db) / 20.0)
+
+
+def build_respiro_detect_command(
+    *,
+    audio_path: Path,
+    python_executable: str,
+    repo_path: Path,
+    weights_path: Path,
+    threshold: float,
+    min_length_ms: int,
+) -> list[str]:
+    script = (
+        "import json, sys, torch; "
+        "from pathlib import Path; "
+        "repo = Path(sys.argv[1]); "
+        "weights = Path(sys.argv[2]); "
+        "audio = Path(sys.argv[3]); "
+        "threshold = float(sys.argv[4]); "
+        "min_length_ms = int(sys.argv[5]); "
+        "sys.path.insert(0, str(repo)); "
+        "from modules import DetectionNet, BreathDetector; "
+        "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'); "
+        "model = DetectionNet().to(device); "
+        "checkpoint = torch.load(str(weights), map_location=device); "
+        "model.load_state_dict(checkpoint['model']); "
+        "model.eval(); "
+        "detector = BreathDetector(model, device=device); "
+        "tree = detector(str(audio), threshold=threshold, min_length=max(1, int(round(min_length_ms / 10.0)))); "
+        "intervals = [{'start_seconds': float(item.begin), 'end_seconds': float(item.end)} for item in sorted(tree)]; "
+        "print(json.dumps({'intervals': intervals}))"
+    )
+    return [
+        python_executable,
+        "-c",
+        script,
+        str(repo_path),
+        str(weights_path),
+        str(audio_path),
+        str(threshold),
+        str(min_length_ms),
+    ]
+
+
+def resolve_respiro_runtime(
+    *,
+    respiro_repo: str | None,
+    respiro_weights: str | None,
+    env_values: dict[str, str] | None = None,
+) -> dict[str, Path | None]:
+    values = env_values or {}
+    repo_value = respiro_repo or values.get("AUDIO_SOUND_RESPIRO_REPO")
+    weights_value = respiro_weights or values.get("AUDIO_SOUND_RESPIRO_WEIGHTS")
+    return {
+        "repo_path": Path(repo_value) if repo_value else None,
+        "weights_path": Path(weights_value) if weights_value else None,
+    }
+
+
+def apply_spectramini_style_cleanup_to_samples(
+    samples: array,
+    *,
+    breath_windows: list[NoiseWindow],
+    sample_rate: int,
+    attenuation_db: float,
+    mouth_declick_sensitivity: float,
+    fade_ms: float,
+) -> array:
+    cleaned = array("h", samples)
+    duck_samples_for_windows(
+        cleaned,
+        sample_rate=sample_rate,
+        windows=breath_windows,
+        floor_gain=attenuation_db_to_gain(attenuation_db),
+        fade_ms=fade_ms,
+    )
+
+    if len(cleaned) < 3:
+        return cleaned
+
+    threshold_scale = max(1.0, 6.0 - (float(mouth_declick_sensitivity) * 4.0))
+    diffs = [abs(int(cleaned[index + 1]) - int(cleaned[index])) for index in range(len(cleaned) - 1)]
+    mean_diff = sum(diffs) / float(len(diffs))
+    variance = sum((diff - mean_diff) ** 2 for diff in diffs) / float(len(diffs))
+    std_diff = variance ** 0.5
+    click_threshold = mean_diff + (threshold_scale * std_diff)
+
+    for _ in range(2):
+        for index in range(1, len(cleaned) - 1):
+            left_delta = abs(int(cleaned[index]) - int(cleaned[index - 1]))
+            right_delta = abs(int(cleaned[index + 1]) - int(cleaned[index]))
+            sample_peak = abs(int(cleaned[index]))
+            polarity_flip = int(cleaned[index - 1]) * int(cleaned[index]) < 0 or int(cleaned[index]) * int(cleaned[index + 1]) < 0
+            if max(left_delta, right_delta) > click_threshold or sample_peak > click_threshold or polarity_flip:
+                cleaned[index] = int((int(cleaned[index - 1]) + int(cleaned[index + 1])) / 2)
+
+    return cleaned
+
+
+def run_respiro_or_fallback_detection(
+    *,
+    audio_path: Path,
+    ffmpeg_bin: str,
+    respiro_repo: Path | None,
+    respiro_weights: Path | None,
+    python_executable: str,
+    threshold: float,
+    min_length_ms: int,
+    fallback_config: dict[str, Any],
+) -> RespiroDetectionResult:
+    def build_fallback_result(
+        *,
+        command: list[str] | None,
+        returncode: int | None,
+        stdout: str,
+        stderr: str,
+        error: str | None,
+    ) -> RespiroDetectionResult:
+        fallback_windows = (
+            detect_breath_onset_windows(
+                audio_path,
+                ffmpeg_bin=ffmpeg_bin,
+                config=fallback_config,
+            )
+            if audio_path.exists()
+            else []
+        )
+        return RespiroDetectionResult(
+            windows=fallback_windows,
+            mode="fallback",
+            assets_present=True,
+            attempted=True,
+            succeeded=False,
+            command=command,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            error=error,
+        )
+
+    assets_present = bool(
+        respiro_repo and respiro_weights and respiro_repo.exists() and respiro_weights.exists()
+    )
+    if assets_present and respiro_repo and respiro_weights:
+        duration_seconds = 0.0
+        if audio_path.exists():
+            try:
+                duration_seconds = _read_wave_duration_seconds(audio_path)
+            except (wave.Error, EOFError, FileNotFoundError):
+                duration_seconds = 0.0
+        segment_length_seconds = 120.0
+        segment_overlap_seconds = 1.0
+        segment_mode = duration_seconds > segment_length_seconds
+
+        if not segment_mode:
+            command = build_respiro_detect_command(
+                audio_path=audio_path,
+                python_executable=python_executable,
+                repo_path=respiro_repo,
+                weights_path=respiro_weights,
+                threshold=threshold,
+                min_length_ms=min_length_ms,
+            )
+            completed = run_command(command)
+            if completed.returncode == 0:
+                try:
+                    payload = json.loads(completed.stdout.strip() or "{}")
+                    intervals = payload.get("intervals", [])
+                    return RespiroDetectionResult(
+                        windows=[
+                            NoiseWindow(
+                                start_seconds=float(item["start_seconds"]),
+                                end_seconds=float(item["end_seconds"]),
+                            )
+                            for item in intervals
+                        ],
+                        mode="respiro",
+                        assets_present=True,
+                        attempted=True,
+                        succeeded=True,
+                        command=command,
+                        returncode=completed.returncode,
+                        stdout=completed.stdout.strip(),
+                        stderr=completed.stderr.strip(),
+                    )
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    error = f"Failed to parse Respiro-en output: {exc}"
+            else:
+                error = completed.stderr.strip() or completed.stdout.strip() or "Respiro-en command failed"
+            return build_fallback_result(
+                command=command,
+                returncode=completed.returncode,
+                stdout=completed.stdout.strip(),
+                stderr=completed.stderr.strip(),
+                error=error,
+            )
+
+        ffmpeg = ensure_tool(ffmpeg_bin)
+        segment_windows: list[NoiseWindow] = []
+        segment_commands: list[list[str]] = []
+        segment_stdout: list[str] = []
+        segment_stderr: list[str] = []
+        segment_count = 0
+
+        with tempfile.TemporaryDirectory(prefix="respiro-segments-") as tmp_dir:
+            temp_root = Path(tmp_dir)
+            start_seconds = 0.0
+            while start_seconds < duration_seconds:
+                segment_start = start_seconds
+                segment_duration = min(segment_length_seconds, duration_seconds - segment_start)
+                segment_wav = temp_root / f"segment_{segment_count:04d}.wav"
+                extract_command = [
+                    ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-nostdin",
+                    "-ss",
+                    f"{segment_start:.3f}",
+                    "-t",
+                    f"{segment_duration:.3f}",
+                    "-i",
+                    str(audio_path),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(segment_wav),
+                ]
+                extract_completed = run_command(extract_command)
+                segment_commands.append(extract_command)
+                if extract_completed.returncode != 0:
+                    error = extract_completed.stderr.strip() or extract_completed.stdout.strip() or "Failed to extract Respiro-en segment"
+                    return build_fallback_result(
+                        command=extract_command,
+                        returncode=extract_completed.returncode,
+                        stdout=extract_completed.stdout.strip(),
+                        stderr=extract_completed.stderr.strip(),
+                        error=error,
+                    )
+
+                detect_command = build_respiro_detect_command(
+                    audio_path=segment_wav,
+                    python_executable=python_executable,
+                    repo_path=respiro_repo,
+                    weights_path=respiro_weights,
+                    threshold=threshold,
+                    min_length_ms=min_length_ms,
+                )
+                detect_completed = run_command(detect_command)
+                segment_commands.append(detect_command)
+                segment_stdout.append(detect_completed.stdout.strip())
+                segment_stderr.append(detect_completed.stderr.strip())
+                if detect_completed.returncode != 0:
+                    error = detect_completed.stderr.strip() or detect_completed.stdout.strip() or "Respiro-en segment command failed"
+                    return build_fallback_result(
+                        command=detect_command,
+                        returncode=detect_completed.returncode,
+                        stdout=detect_completed.stdout.strip(),
+                        stderr=detect_completed.stderr.strip(),
+                        error=error,
+                    )
+                try:
+                    payload = json.loads(detect_completed.stdout.strip() or "{}")
+                    intervals = payload.get("intervals", [])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    return build_fallback_result(
+                        command=detect_command,
+                        returncode=detect_completed.returncode,
+                        stdout=detect_completed.stdout.strip(),
+                        stderr=detect_completed.stderr.strip(),
+                        error=f"Failed to parse Respiro-en segment output: {exc}",
+                    )
+
+                for item in intervals:
+                    adjusted_start = segment_start + float(item["start_seconds"])
+                    adjusted_end = segment_start + float(item["end_seconds"])
+                    segment_windows.append(
+                        NoiseWindow(
+                            start_seconds=adjusted_start,
+                            end_seconds=adjusted_end,
+                        )
+                    )
+
+                segment_count += 1
+                if segment_start + segment_duration >= duration_seconds:
+                    break
+                start_seconds += max(1.0, segment_length_seconds - segment_overlap_seconds)
+
+        merged_windows = merge_noise_windows(segment_windows, max_gap_seconds=0.05)
+        return RespiroDetectionResult(
+            windows=merged_windows,
+            mode="respiro",
+            assets_present=True,
+            attempted=True,
+            succeeded=True,
+            command=segment_commands[-1] if segment_commands else None,
+            returncode=0,
+            stdout="\n".join(line for line in segment_stdout if line),
+            stderr="\n".join(line for line in segment_stderr if line),
+            error=None,
+        )
+    fallback_windows = (
+        detect_breath_onset_windows(
+            audio_path,
+            ffmpeg_bin=ffmpeg_bin,
+            config=fallback_config,
+        )
+        if audio_path.exists()
+        else []
+    )
+    return RespiroDetectionResult(
+        windows=fallback_windows,
+        mode="fallback",
+        assets_present=False,
+        attempted=False,
+        succeeded=False,
+        error="Respiro-en assets not configured or missing"
+        if (respiro_repo or respiro_weights)
+        else None,
+    )
 
 
 def discover_media_files(input_path: Path, recursive: bool = False) -> list[Path]:
@@ -168,7 +558,8 @@ def ffprobe_media(path: Path, ffprobe_bin: str) -> dict[str, Any]:
 
 
 def build_output_layout(*, input_path: Path, output_root: Path, run_slug: str) -> OutputLayout:
-    job_name = f"{run_slug}_{_slugify_stem(input_path.stem)}"
+    file_base_name = input_path.stem
+    job_name = f"{run_slug}_{file_base_name}"
     job_dir = output_root / job_name
     preprocess_dir = job_dir / "audio_preprocess"
     transcript_dir = job_dir / "transcript_ready"
@@ -177,11 +568,11 @@ def build_output_layout(*, input_path: Path, output_root: Path, run_slug: str) -
         job_dir=job_dir,
         preprocess_dir=preprocess_dir,
         transcript_dir=transcript_dir,
-        raw_wav=preprocess_dir / "audio_raw.wav",
-        denoised_wav=preprocess_dir / "audio_df.wav",
-        noise_sample_wav=preprocess_dir / "audio_noise_sample.wav",
-        clean_wav=preprocess_dir / "audio_clean.wav",
-        transcript_mp3=transcript_dir / "audio.mp3",
+        raw_wav=preprocess_dir / f"{file_base_name}_raw.wav",
+        denoised_wav=preprocess_dir / f"{file_base_name}_df.wav",
+        noise_sample_wav=preprocess_dir / f"{file_base_name}_noise_sample.wav",
+        clean_wav=preprocess_dir / f"{file_base_name}_clean.wav",
+        transcript_mp3=transcript_dir / f"{file_base_name}_transcript.mp3",
         report_json=preprocess_dir / "audio_process_report.json",
         report_md=preprocess_dir / "audio_process_report.md",
         deepfilternet_dir=preprocess_dir / "deepfilternet_out",
@@ -209,7 +600,7 @@ def build_ffmpeg_extract_command(*, input_path: Path, raw_wav: Path, preset: dic
 
 
 def build_deepfilternet_command(*, raw_wav: Path, output_dir: Path, preset: dict[str, Any], python_executable: str) -> list[str]:
-    config = preset["deepfilternet"]
+    config = get_pipeline_stage(preset, "deepfilternet")
     command = [
         python_executable,
         "-m",
@@ -374,12 +765,15 @@ def build_mastering_filter_chain(
 
     compressor = filters.get("compressor", {})
     if include_compressor and compressor.get("enabled"):
-        parts.append(
+        compressor_part = (
             "acompressor="
             f"threshold={compressor['threshold_db']}dB:ratio={compressor['ratio']}:"
-            f"attack={compressor['attack_ms']}:release={compressor['release_ms']}:"
-            f"makeup={compressor['makeup_db']}"
+            f"attack={compressor['attack_ms']}:release={compressor['release_ms']}"
         )
+        makeup_db = compressor.get("makeup_db")
+        if makeup_db is not None and float(makeup_db) >= 1:
+            compressor_part += f":makeup={makeup_db}"
+        parts.append(compressor_part)
 
     speech_norm = filters.get("speech_norm", {})
     if include_speech_norm and speech_norm.get("enabled"):
@@ -930,6 +1324,88 @@ def duck_audio_file_in_place(
     temp_path.replace(audio_path)
 
 
+def _amplitude_to_dbfs(amplitude: float) -> float:
+    if amplitude <= 0:
+        return -120.0
+    return 20.0 * math.log10(amplitude / 32767.0)
+
+
+def measure_segment_levels(
+    samples: array,
+    *,
+    start_index: int,
+    end_index: int,
+) -> tuple[float, float]:
+    start = max(0, min(len(samples), start_index))
+    end = max(start, min(len(samples), end_index))
+    if end <= start:
+        return -120.0, -120.0
+
+    peak = 0
+    energy = 0.0
+    count = end - start
+    for index in range(start, end):
+        value = abs(int(samples[index]))
+        if value > peak:
+            peak = value
+        energy += float(value * value)
+
+    rms = math.sqrt(energy / float(count)) if count else 0.0
+    return _amplitude_to_dbfs(float(peak)), _amplitude_to_dbfs(rms)
+
+
+def infer_pause_residual_cleanup_windows(
+    samples: array,
+    *,
+    sample_rate: int,
+    silence_candidates: list[dict[str, float]],
+    min_neighbor_silence_duration: float,
+    bridge_max_duration: float,
+    bridge_peak_db: float,
+    bridge_rms_db: float,
+    core_pad_seconds: float,
+) -> list[NoiseWindow]:
+    windows: list[NoiseWindow] = []
+    silence_windows = [
+        NoiseWindow(
+            start_seconds=float(item["start_seconds"]),
+            end_seconds=float(item["end_seconds"]),
+        )
+        for item in silence_candidates
+    ]
+
+    for window in silence_windows:
+        duration = window.end_seconds - window.start_seconds
+        if duration <= (core_pad_seconds * 2.0):
+            continue
+        core_start = window.start_seconds + core_pad_seconds
+        core_end = window.end_seconds - core_pad_seconds
+        if core_end > core_start:
+            windows.append(NoiseWindow(start_seconds=core_start, end_seconds=core_end))
+
+    for previous, current in zip(silence_windows, silence_windows[1:]):
+        previous_duration = previous.end_seconds - previous.start_seconds
+        current_duration = current.end_seconds - current.start_seconds
+        if previous_duration < min_neighbor_silence_duration or current_duration < min_neighbor_silence_duration:
+            continue
+
+        bridge_start = previous.end_seconds
+        bridge_end = current.start_seconds
+        bridge_duration = bridge_end - bridge_start
+        if bridge_duration <= 0.0 or bridge_duration > bridge_max_duration:
+            continue
+
+        peak_db, rms_db = measure_segment_levels(
+            samples,
+            start_index=int(bridge_start * sample_rate),
+            end_index=int(bridge_end * sample_rate),
+        )
+        if peak_db <= bridge_peak_db and rms_db <= bridge_rms_db:
+            windows.append(NoiseWindow(start_seconds=bridge_start, end_seconds=bridge_end))
+
+    return merge_noise_windows(windows, max_gap_seconds=0.02)
+
+
 def _ensure_directories(layout: OutputLayout) -> None:
     layout.preprocess_dir.mkdir(parents=True, exist_ok=True)
     layout.transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -945,11 +1421,21 @@ def _find_single_wav(directory: Path) -> Path:
     return candidates[0]
 
 
-def _processing_steps(preset: dict[str, Any]) -> list[str]:
-    steps = [
-        "Extract source audio to WAV",
-        "Primary denoise via DeepFilterNet",
-    ]
+def _processing_steps(
+    preset: dict[str, Any],
+    *,
+    skip_spectramini: bool = False,
+    skip_deepfilternet: bool = False,
+) -> list[str]:
+    steps = ["Extract source audio to WAV"]
+    stage_types = [stage.get("type") for stage in preset.get("pipeline", {}).get("stages", []) if stage.get("enabled", True)]
+    if "respiro" in stage_types:
+        steps.append("Breath detection via Respiro-en")
+    if "spectramini" in stage_types and not skip_spectramini:
+        steps.append("SpectraMini-style breath control")
+        steps.append("SpectraMini-style mouth de-click")
+    if "deepfilternet" in stage_types and not skip_deepfilternet:
+        steps.append("Primary denoise via DeepFilterNet")
     filters = preset["filters"]
     if filters.get("declick", {}).get("enabled"):
         steps.append("Mouth-click reduction via adeclick")
@@ -969,18 +1455,34 @@ def _processing_steps(preset: dict[str, Any]) -> list[str]:
         steps.append("Speech leveling via speechnorm")
     if filters.get("breath_onset_cleanup", {}).get("enabled"):
         steps.append("Breath-onset cleanup before speech entries")
+    if filters.get("pause_residual_cleanup", {}).get("enabled"):
+        steps.append("Residual pause cleanup in long silences")
     steps.append("Loudness normalization via loudnorm")
     steps.append("Transcript-ready MP3 export")
     return steps
 
 
-def _noise_print_processing_steps(preset: dict[str, Any]) -> list[str]:
-    steps = [
-        "Extract source audio to WAV",
-        "Primary denoise via DeepFilterNet",
-        "Capture noise sample from selected windows",
-        "Noise-print denoise via afftdn sample capture",
-    ]
+def _noise_print_processing_steps(
+    preset: dict[str, Any],
+    *,
+    skip_spectramini: bool = False,
+    skip_deepfilternet: bool = False,
+) -> list[str]:
+    steps = ["Extract source audio to WAV"]
+    stage_types = [stage.get("type") for stage in preset.get("pipeline", {}).get("stages", []) if stage.get("enabled", True)]
+    if "respiro" in stage_types:
+        steps.append("Breath detection via Respiro-en")
+    if "spectramini" in stage_types and not skip_spectramini:
+        steps.append("SpectraMini-style breath control")
+        steps.append("SpectraMini-style mouth de-click")
+    if "deepfilternet" in stage_types and not skip_deepfilternet:
+        steps.append("Primary denoise via DeepFilterNet")
+    steps.extend(
+        [
+            "Capture noise sample from selected windows",
+            "Noise-print denoise via afftdn sample capture",
+        ]
+    )
     filters = preset["filters"]
     if filters.get("declick", {}).get("enabled"):
         steps.append("Mouth-click reduction via adeclick")
@@ -998,6 +1500,8 @@ def _noise_print_processing_steps(preset: dict[str, Any]) -> list[str]:
         steps.append("Speech leveling via speechnorm")
     if filters.get("breath_onset_cleanup", {}).get("enabled"):
         steps.append("Breath-onset cleanup before speech entries")
+    if filters.get("pause_residual_cleanup", {}).get("enabled"):
+        steps.append("Residual pause cleanup in long silences")
     steps.append("Loudness normalization via loudnorm")
     steps.append("Transcript-ready MP3 export")
     return steps
@@ -1011,6 +1515,31 @@ def _normalize_noise_windows(noise_windows: list[NoiseWindow] | None) -> list[No
     return list(noise_windows or [])
 
 
+def _load_wave_samples(audio_path: Path) -> tuple[Any, array]:
+    with wave.open(str(audio_path), "rb") as reader:
+        params = reader.getparams()
+        if params.sampwidth != 2 or params.nchannels != 1:
+            raise ValueError("Expected mono 16-bit WAV audio")
+        raw_frames = reader.readframes(params.nframes)
+    samples = array("h")
+    samples.frombytes(raw_frames)
+    return params, samples
+
+
+def _read_wave_duration_seconds(audio_path: Path) -> float:
+    with wave.open(str(audio_path), "rb") as reader:
+        frame_rate = reader.getframerate()
+        if frame_rate <= 0:
+            return 0.0
+        return reader.getnframes() / float(frame_rate)
+
+
+def _write_wave_samples(audio_path: Path, params: Any, samples: array) -> None:
+    with wave.open(str(audio_path), "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(samples.tobytes())
+
+
 def process_media_file(
     input_file: Path,
     *,
@@ -1021,6 +1550,13 @@ def process_media_file(
     run_slug: str,
     input_metadata: dict[str, Any] | None = None,
     noise_windows: list[NoiseWindow] | None = None,
+    respiro_repo: Path | None = None,
+    respiro_weights: Path | None = None,
+    attenuation_db: float = 18.0,
+    respiro_threshold: float | None = None,
+    respiro_min_length_ms: int | None = None,
+    skip_spectramini: bool = False,
+    skip_deepfilternet: bool = False,
 ) -> dict[str, Any]:
     metadata = input_metadata or ffprobe_media(input_file, runtime.ffprobe_bin)
     layout = build_output_layout(input_path=input_file, output_root=output_root, run_slug=run_slug)
@@ -1034,8 +1570,16 @@ def process_media_file(
 
     commands: list[list[str]] = [
         build_ffmpeg_extract_command(input_path=input_file, raw_wav=layout.raw_wav, preset=preset, ffmpeg_bin=ffmpeg),
-        build_deepfilternet_command(raw_wav=layout.raw_wav, output_dir=layout.deepfilternet_dir, preset=preset, python_executable=python_bin),
     ]
+    if not skip_deepfilternet:
+        commands.append(
+            build_deepfilternet_command(
+                raw_wav=layout.raw_wav,
+                output_dir=layout.deepfilternet_dir,
+                preset=preset,
+                python_executable=python_bin,
+            )
+        )
     if resolved_noise_windows:
         commands.append(
             build_ffmpeg_noise_sample_command(
@@ -1059,9 +1603,17 @@ def process_media_file(
     )
 
     processing_steps = (
-        _noise_print_processing_steps(preset)
+        _noise_print_processing_steps(
+            preset,
+            skip_spectramini=skip_spectramini,
+            skip_deepfilternet=skip_deepfilternet,
+        )
         if resolved_noise_windows
-        else _processing_steps(preset)
+        else _processing_steps(
+            preset,
+            skip_spectramini=skip_spectramini,
+            skip_deepfilternet=skip_deepfilternet,
+        )
     )
 
     report: dict[str, Any] = {
@@ -1093,6 +1645,21 @@ def process_media_file(
         "silence_candidates": [],
         "loudnorm_summary": None,
         "notes": preset.get("notes", []),
+        "respiro_detection_mode": "disabled",
+        "respiro_assets_present": bool(
+            respiro_repo and respiro_weights and respiro_repo.exists() and respiro_weights.exists()
+        ),
+        "respiro_attempted": False,
+        "respiro_succeeded": False,
+        "respiro_returncode": None,
+        "respiro_error": None,
+        "respiro_repo_path": str(respiro_repo) if respiro_repo else None,
+        "respiro_weights_path": str(respiro_weights) if respiro_weights else None,
+        "respiro_command": None,
+        "respiro_stdout": "",
+        "respiro_stderr": "",
+        "spectramini_applied": False,
+        "pause_residual_cleanup_windows": [],
     }
 
     if runtime.dry_run:
@@ -1101,11 +1668,71 @@ def process_media_file(
     _ensure_directories(layout)
     executed: list[dict[str, Any]] = []
 
-    for command in commands[:2]:
-        completed = run_command(command)
+    extract_command = commands[0]
+    completed = run_command(extract_command)
+    executed.append(
+        {
+            "command": extract_command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "command failed")
+
+    respiro_stage = get_pipeline_stage(preset, "respiro")
+    fallback_config = {
+        **DEFAULT_BREATH_FALLBACK_CONFIG,
+        **preset.get("filters", {}).get("breath_onset_cleanup", {}),
+    }
+    threshold = float(respiro_threshold if respiro_threshold is not None else respiro_stage.get("threshold", 0.064))
+    min_length = int(respiro_min_length_ms if respiro_min_length_ms is not None else respiro_stage.get("min_length_ms", 20))
+    respiro_result = run_respiro_or_fallback_detection(
+        audio_path=layout.raw_wav,
+        ffmpeg_bin=runtime.ffmpeg_bin,
+        respiro_repo=respiro_repo,
+        respiro_weights=respiro_weights,
+        python_executable=python_bin,
+        threshold=threshold,
+        min_length_ms=min_length,
+        fallback_config=fallback_config,
+    )
+    breath_windows = respiro_result.windows
+    report["breath_onset_windows"] = [
+        {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
+        for window in breath_windows
+    ]
+    report["respiro_detection_mode"] = respiro_result.mode
+    report["respiro_assets_present"] = respiro_result.assets_present
+    report["respiro_attempted"] = respiro_result.attempted
+    report["respiro_succeeded"] = respiro_result.succeeded
+    report["respiro_returncode"] = respiro_result.returncode
+    report["respiro_error"] = respiro_result.error
+    report["respiro_command"] = respiro_result.command
+    report["respiro_stdout"] = respiro_result.stdout
+    report["respiro_stderr"] = respiro_result.stderr
+
+    if layout.raw_wav.exists() and (breath_windows or not skip_spectramini):
+        params, samples = _load_wave_samples(layout.raw_wav)
+        spectramini_stage = get_pipeline_stage(preset, "spectramini")
+        cleaned = apply_spectramini_style_cleanup_to_samples(
+            samples,
+            breath_windows=breath_windows,
+            sample_rate=params.framerate,
+            attenuation_db=attenuation_db,
+            mouth_declick_sensitivity=float(spectramini_stage.get("mouth_declick_sensitivity", 0.55)),
+            fade_ms=float(fallback_config.get("fade_ms", 14.0)),
+        )
+        _write_wave_samples(layout.raw_wav, params, cleaned)
+        report["spectramini_applied"] = not skip_spectramini
+
+    if not skip_deepfilternet:
+        deepfilter_command = commands[1]
+        completed = run_command(deepfilter_command)
         executed.append(
             {
-                "command": command,
+                "command": deepfilter_command,
                 "returncode": completed.returncode,
                 "stdout": completed.stdout.strip(),
                 "stderr": completed.stderr.strip(),
@@ -1114,11 +1741,13 @@ def process_media_file(
         if completed.returncode != 0:
             raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "command failed")
 
-    detected_df_wav = _find_single_wav(layout.deepfilternet_dir)
-    if detected_df_wav.resolve() != layout.denoised_wav.resolve():
-        detected_df_wav.replace(layout.denoised_wav)
-
-    remaining_commands = commands[2:]
+        detected_df_wav = _find_single_wav(layout.deepfilternet_dir)
+        if detected_df_wav.resolve() != layout.denoised_wav.resolve():
+            detected_df_wav.replace(layout.denoised_wav)
+        remaining_commands = commands[2:]
+    else:
+        shutil.copyfile(layout.raw_wav, layout.denoised_wav)
+        remaining_commands = commands[1:]
     for command in remaining_commands:
         completed = run_command(command)
         executed.append(
@@ -1139,7 +1768,7 @@ def process_media_file(
             ffmpeg_bin=runtime.ffmpeg_bin,
             config=breath_onset_cleanup,
         )
-        report["breath_onset_windows"] = [
+        report["postprocess_breath_onset_windows"] = [
             {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
             for window in breath_windows
         ]
@@ -1151,7 +1780,38 @@ def process_media_file(
                 fade_ms=float(breath_onset_cleanup["fade_ms"]),
             )
     else:
-        report["breath_onset_windows"] = []
+        report["postprocess_breath_onset_windows"] = []
+
+    pause_residual_cleanup = preset.get("filters", {}).get("pause_residual_cleanup", {})
+    if pause_residual_cleanup.get("enabled"):
+        silence_candidates = detect_silence_candidates(
+            layout.clean_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            threshold_db=float(pause_residual_cleanup["silence_threshold_db"]),
+            min_duration=float(pause_residual_cleanup["silence_min_duration"]),
+        )
+        params, samples = _load_wave_samples(layout.clean_wav)
+        pause_windows = infer_pause_residual_cleanup_windows(
+            samples,
+            sample_rate=params.framerate,
+            silence_candidates=silence_candidates,
+            min_neighbor_silence_duration=float(pause_residual_cleanup["min_neighbor_silence_duration"]),
+            bridge_max_duration=float(pause_residual_cleanup["bridge_max_duration"]),
+            bridge_peak_db=float(pause_residual_cleanup["bridge_peak_db"]),
+            bridge_rms_db=float(pause_residual_cleanup["bridge_rms_db"]),
+            core_pad_seconds=float(pause_residual_cleanup["core_pad_ms"]) / 1000.0,
+        )
+        report["pause_residual_cleanup_windows"] = [
+            {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
+            for window in pause_windows
+        ]
+        if pause_windows:
+            duck_audio_file_in_place(
+                layout.clean_wav,
+                windows=pause_windows,
+                floor_gain=float(pause_residual_cleanup["floor_gain"]),
+                fade_ms=float(pause_residual_cleanup["fade_ms"]),
+            )
 
     report["executed"] = executed
     report["loudnorm_summary"] = extract_loudnorm_summary(executed[-2]["stderr"])
@@ -1210,6 +1870,14 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             "",
             "## Noise Sample",
             f"- Duration: `{report.get('noise_sample_duration_seconds')}`",
+            "",
+            "## Respiro Detection",
+            f"- Mode: `{report.get('respiro_detection_mode')}`",
+            f"- Assets present: `{report.get('respiro_assets_present')}`",
+            f"- Attempted: `{report.get('respiro_attempted')}`",
+            f"- Succeeded: `{report.get('respiro_succeeded')}`",
+            f"- Return code: `{report.get('respiro_returncode')}`",
+            f"- Error: `{report.get('respiro_error')}`",
             "",
             "## Breath Onset Windows",
             *breath_onset_lines,

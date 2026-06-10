@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 audio-cleanup = "audio_sound.cli:main"
+audio-skill-workflow = "audio_sound.skill_workflow:main"
 
 [tool.setuptools]
 packages = ["audio_sound"]

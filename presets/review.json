@@ -5,15 +5,33 @@
     "Use when you want cleaned output and a shortlist of candidate pause or breath regions.",
     "The report is heuristic and should be treated as review assistance, not semantic speech understanding."
   ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.064,
+        "min_length_ms": 20
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.5,
+        "breath_control_sensitivity": 0.5,
+        "mouth_declick_sensitivity": 0.6
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
   "extract": {
     "sample_rate": 48000,
     "channels": 1,
     "pcm_codec": "pcm_s16le"
-  },
-  "deepfilternet": {
-    "enabled": true,
-    "module": "df.enhance",
-    "post_filter": true
   },
   "filters": {
     "highpass_hz": 70,
@@ -38,12 +56,12 @@
       "ratio": 2.0,
       "attack_ms": 12,
       "release_ms": 140,
-      "makeup_db": 2
+      "makeup_db": 1
     },
     "loudnorm": {
-      "target_i": -16.0,
+      "target_i": -16.8,
       "target_lra": 7.0,
-      "target_tp": -1.5
+      "target_tp": -3.0
     }
   },
   "analysis": {

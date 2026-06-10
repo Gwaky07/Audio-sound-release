@@ -10,12 +10,13 @@ Make `Audio-sound` a standalone audio processing repository that can be called d
 
 Location:
 
-- `.codex/skills/audio-cleanup/`
+- `.codex/skills/audio-sound/`
 
 Responsibility:
 
-- map natural-language intent to a preset and a small set of CLI overrides
+- map natural-language intent to the approved workflow mode and the minimum required CLI overrides
 - keep Codex invocation stable even as the processing internals evolve
+- cover both first-pass delivery and exact timestamp repair in one repository-local entry
 
 ### 2. Bootstrap layer
 
@@ -25,8 +26,8 @@ Location:
 
 Responsibility:
 
-- inspect Python, FFmpeg, FFprobe, and DeepFilterNet availability
-- provide repo-local setup/install commands
+- inspect Python, FFmpeg, FFprobe, Respiro-en runtime prerequisites, and DeepFilterNet availability
+- provide repo-local setup/install commands, including Respiro-en asset bootstrapping
 - emit machine-readable runtime reports
 
 ### 3. Config layer
@@ -52,9 +53,14 @@ Responsibility:
 
 - discover media files
 - inspect media with FFprobe
-- build deterministic extraction, denoise, and finalize commands
+- build deterministic extraction, Respiro-en-first cleanup, denoise, and finalize commands
 - maintain ASCII-stable output layout
 - generate per-file and batch reports
+
+Runtime note:
+
+- if local Respiro-en repo and weights are configured, the pipeline runs the real detector
+- otherwise it falls back to the local heuristic breath detector so the full cleanup chain remains runnable
 
 ### 5. CLI layer
 
@@ -72,10 +78,18 @@ Responsibility:
 For each input file:
 
 1. extract mono WAV with FFmpeg
-2. run DeepFilterNet on the extracted WAV
-3. run FFmpeg mastering filters on the denoised WAV
-4. export transcript-ready MP3
-5. write JSON and Markdown reports
+2. detect breath regions via Respiro-en
+3. apply SpectraMini-style breath control and mouth de-click cleanup
+4. run DeepFilterNet on the extracted WAV
+5. run FFmpeg mastering filters on the denoised WAV
+6. export transcript-ready MP3
+7. write JSON and Markdown reports
+
+Default path note:
+
+- the primary path is `Respiro-en -> SpectraMini-style cleanup -> DeepFilterNet -> FFmpeg mastering`
+- older `breath_ducking` and `breath_onset_cleanup` FFmpeg filters remain in the repo only as explicit compatibility mode
+- compatibility is opt-in through CLI/runtime overrides and is not enabled by default presets
 
 ## Why this split
 
