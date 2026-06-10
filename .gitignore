@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.env
 .omx/
 .worktrees/
 .cargo-home/
@@ -18,3 +19,4 @@ build/
 output/
 scratch/
 tmp/
+tools/

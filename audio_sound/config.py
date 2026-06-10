@@ -28,8 +28,8 @@ def validate_preset(preset: dict[str, Any]) -> None:
     required_top_level = [
         "name",
         "description",
+        "pipeline",
         "extract",
-        "deepfilternet",
         "filters",
         "analysis",
         "transcript_export",
@@ -46,6 +46,7 @@ def apply_runtime_overrides(
     denoise_strength: str | None = None,
     disable_gate: bool = False,
     enable_silence_report: bool = False,
+    enable_legacy_breath_filters: bool = False,
 ) -> dict[str, Any]:
     resolved = copy.deepcopy(preset)
 
@@ -67,6 +68,12 @@ def apply_runtime_overrides(
 
     if enable_silence_report:
         resolved["analysis"]["silence_candidates"] = True
+
+    if enable_legacy_breath_filters:
+        if "breath_ducking" in resolved["filters"]:
+            resolved["filters"]["breath_ducking"]["enabled"] = True
+        if "breath_onset_cleanup" in resolved["filters"]:
+            resolved["filters"]["breath_onset_cleanup"]["enabled"] = True
 
     return resolved
 

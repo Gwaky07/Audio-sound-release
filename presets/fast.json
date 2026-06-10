@@ -5,15 +5,33 @@
     "Use for previews, rough dailies, and large spoken-word batches.",
     "Primary denoise remains enabled, but dynamic processing stays lighter than the safe preset."
   ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.08,
+        "min_length_ms": 24
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.45,
+        "breath_control_sensitivity": 0.45,
+        "mouth_declick_sensitivity": 0.45
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
   "extract": {
     "sample_rate": 48000,
     "channels": 1,
     "pcm_codec": "pcm_s16le"
-  },
-  "deepfilternet": {
-    "enabled": true,
-    "module": "df.enhance",
-    "post_filter": true
   },
   "filters": {
     "highpass_hz": 70,
@@ -38,12 +56,12 @@
       "ratio": 2.0,
       "attack_ms": 10,
       "release_ms": 120,
-      "makeup_db": 2
+      "makeup_db": 1
     },
     "loudnorm": {
-      "target_i": -16.0,
+      "target_i": -16.8,
       "target_lra": 7.0,
-      "target_tp": -1.5
+      "target_tp": -3.0
     }
   },
   "analysis": {
