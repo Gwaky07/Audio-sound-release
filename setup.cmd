@@ -1,5 +1,6 @@
 @echo off
 setlocal
+set "PATH=%~dp0ffmpeg\bin;%PATH%"
 if not exist ".venv\Scripts\python.exe" (
   python -m venv .venv
 )
