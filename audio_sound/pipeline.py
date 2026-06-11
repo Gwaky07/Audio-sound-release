@@ -1540,6 +1540,124 @@ def _write_wave_samples(audio_path: Path, params: Any, samples: array) -> None:
         writer.writeframes(samples.tobytes())
 
 
+def repair_deepfilternet_speech_dropouts(
+    reference_samples: array,
+    processed_samples: array,
+    *,
+    sample_rate: int,
+    window_seconds: float = 0.06,
+    hop_seconds: float = 0.01,
+    reference_peak_db_min: float = -24.0,
+    reference_rms_db_min: float = -38.0,
+    processed_peak_db_max: float = -34.0,
+    processed_rms_db_max: float = -46.0,
+    copy_padding_seconds: float = 0.008,
+    max_repair_duration_seconds: float = 0.16,
+    context_window_seconds: float = 0.22,
+    context_gap_seconds: float = 0.02,
+    context_peak_db_min: float = -20.0,
+    context_rms_db_min: float = -32.0,
+) -> tuple[array, list[NoiseWindow]]:
+    if len(reference_samples) != len(processed_samples):
+        raise ValueError("reference_samples and processed_samples must have the same length")
+    if not reference_samples:
+        return array("h", processed_samples), []
+
+    window_size = max(1, int(window_seconds * sample_rate))
+    hop_size = max(1, int(hop_seconds * sample_rate))
+    copy_padding = max(0, int(copy_padding_seconds * sample_rate))
+    max_repair_samples = max(window_size, int(max_repair_duration_seconds * sample_rate))
+    context_window_size = max(1, int(context_window_seconds * sample_rate))
+    context_gap_size = max(0, int(context_gap_seconds * sample_rate))
+    total_samples = len(reference_samples)
+
+    candidate_windows: list[NoiseWindow] = []
+
+    def has_voiced_context(start_index: int, end_index: int) -> bool:
+        left_end = max(0, start_index - context_gap_size)
+        left_start = max(0, left_end - context_window_size)
+        right_start = min(total_samples, end_index + context_gap_size)
+        right_end = min(total_samples, right_start + context_window_size)
+        if left_end <= left_start or right_end <= right_start:
+            return False
+
+        left_peak_db, left_rms_db = measure_segment_levels(
+            reference_samples,
+            start_index=left_start,
+            end_index=left_end,
+        )
+        right_peak_db, right_rms_db = measure_segment_levels(
+            reference_samples,
+            start_index=right_start,
+            end_index=right_end,
+        )
+        return (
+            left_peak_db >= context_peak_db_min
+            and left_rms_db >= context_rms_db_min
+            and right_peak_db >= context_peak_db_min
+            and right_rms_db >= context_rms_db_min
+        )
+
+    index = 0
+    while index + window_size <= total_samples:
+        ref_peak_db, ref_rms_db = measure_segment_levels(
+            reference_samples,
+            start_index=index,
+            end_index=index + window_size,
+        )
+        proc_peak_db, proc_rms_db = measure_segment_levels(
+            processed_samples,
+            start_index=index,
+            end_index=index + window_size,
+        )
+        if (
+            ref_peak_db >= reference_peak_db_min
+            and ref_rms_db >= reference_rms_db_min
+            and proc_peak_db <= processed_peak_db_max
+            and proc_rms_db <= processed_rms_db_max
+        ):
+            start = index
+            end = index + window_size
+            index += hop_size
+            while index + window_size <= total_samples:
+                ref_peak_db, ref_rms_db = measure_segment_levels(
+                    reference_samples,
+                    start_index=index,
+                    end_index=index + window_size,
+                )
+                proc_peak_db, proc_rms_db = measure_segment_levels(
+                    processed_samples,
+                    start_index=index,
+                    end_index=index + window_size,
+                )
+                if not (
+                    ref_peak_db >= reference_peak_db_min
+                    and ref_rms_db >= reference_rms_db_min
+                    and proc_peak_db <= processed_peak_db_max
+                    and proc_rms_db <= processed_rms_db_max
+                ):
+                    break
+                end = index + window_size
+                index += hop_size
+            if (end - start) <= max_repair_samples and has_voiced_context(start, end):
+                candidate_windows.append(
+                    NoiseWindow(
+                        start_seconds=max(0.0, (start - copy_padding) / float(sample_rate)),
+                        end_seconds=min(total_samples / float(sample_rate), (end + copy_padding) / float(sample_rate)),
+                    )
+                )
+            continue
+        index += hop_size
+
+    merged_windows = merge_noise_windows(candidate_windows, max_gap_seconds=max(0.01, hop_seconds * 2.0))
+    repaired = array("h", processed_samples)
+    for window in merged_windows:
+        start_index = max(0, min(total_samples, int(window.start_seconds * sample_rate)))
+        end_index = max(start_index, min(total_samples, int(window.end_seconds * sample_rate)))
+        repaired[start_index:end_index] = reference_samples[start_index:end_index]
+    return repaired, merged_windows
+
+
 def process_media_file(
     input_file: Path,
     *,
@@ -1744,9 +1862,25 @@ def process_media_file(
         detected_df_wav = _find_single_wav(layout.deepfilternet_dir)
         if detected_df_wav.resolve() != layout.denoised_wav.resolve():
             detected_df_wav.replace(layout.denoised_wav)
+        repair_windows: list[NoiseWindow] = []
+        if layout.raw_wav.exists() and layout.denoised_wav.exists():
+            raw_params, raw_samples = _load_wave_samples(layout.raw_wav)
+            denoised_params, denoised_samples = _load_wave_samples(layout.denoised_wav)
+            repaired_samples, repair_windows = repair_deepfilternet_speech_dropouts(
+                raw_samples,
+                denoised_samples,
+                sample_rate=denoised_params.framerate,
+            )
+            if repair_windows:
+                _write_wave_samples(layout.denoised_wav, denoised_params, repaired_samples)
+        report["deepfilternet_dropout_repair_windows"] = [
+            {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
+            for window in repair_windows
+        ]
         remaining_commands = commands[2:]
     else:
         shutil.copyfile(layout.raw_wav, layout.denoised_wav)
+        report["deepfilternet_dropout_repair_windows"] = []
         remaining_commands = commands[1:]
     for command in remaining_commands:
         completed = run_command(command)

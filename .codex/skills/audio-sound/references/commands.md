@@ -34,6 +34,19 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode refe
 python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --focus-window 节点A,234.8,1.4 --focus-window 节点B,530.3,1.1
 ```
 
+排查“开头突然多出来声音”和“某个字断开/吞字”时，必须带 focus-window：
+
+```bash
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --focus-window start_artifact_1s,0.75,0.9 --focus-window zishi_12s,11.65,1.25
+```
+
+运行后重点检查：
+
+- `audio_process_report.json` 里的 `respiro_succeeded`
+- `audio_process_report.json` 里的 `deepfilternet_dropout_repair_windows`
+- `workflow_artifacts/spectrograms/focus/` 下的局部频谱图
+- 最终 WAV/MP3 文件名是否带运行编号
+
 ## 6. 同文件噪声窗口驱动的隔离模式
 
 ```bash
@@ -72,3 +85,38 @@ python ../../../scripts/narrow_onset_cleanup.py "<输入WAV>" --output "<输出W
 ```
 
 这个脚本适合做起字前的窄窗口清理，但如果用户已经明确点名具体时间点，优先直接做 `exact_window_cleanup.py`。
+
+## 10. 分阶段能量巡检
+
+当怀疑 DeepFilterNet 恢复错了、后处理吞字、或某个黑色断档是否影响发音时，先对比阶段文件：
+
+```powershell
+@'
+from pathlib import Path
+import json
+from audio_sound.pipeline import _load_wave_samples, measure_segment_levels
+
+root = Path("<本次 workflow root>")
+core_report = next(root.rglob("audio_process_report.json"))
+workflow_report = next(root.rglob("skill-file-report.json"))
+core = json.loads(core_report.read_text(encoding="utf-8"))
+workflow = json.loads(workflow_report.read_text(encoding="utf-8"))
+files = {
+    "raw_after_respiro_spectra": Path(core["outputs"]["raw_wav"]),
+    "deepfilternet": Path(core["outputs"]["denoised_wav"]),
+    "mastered": Path(core["outputs"]["clean_wav"]),
+    "delivered": Path(workflow["deliverables"]["wav"]),
+}
+windows = [("check", 1.08, 1.20)]
+for label, path in files.items():
+    params, samples = _load_wave_samples(path)
+    print(label, path.name)
+    for name, start, end in windows:
+        peak, rms = measure_segment_levels(
+            samples,
+            start_index=int(start * params.framerate),
+            end_index=int(end * params.framerate),
+        )
+        print(name, start, end, peak, rms)
+'@ | python -
+```

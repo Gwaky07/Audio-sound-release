@@ -57,6 +57,13 @@ class BridgeCleanupConfig:
     bridge_gap_seconds: float = 0.12
     bridge_peak_db: float = -18.0
     bridge_rms_db: float = -26.0
+    protected_gap_seconds: float = 0.075
+    protected_bridge_peak_db: float = -22.0
+    protected_bridge_rms_db: float = -30.0
+    protected_silence_max_seconds: float = 0.42
+    protected_context_probe_seconds: float = 0.12
+    protected_context_peak_db: float = -18.0
+    protected_context_rms_db: float = -30.0
     short_trim_seconds: float = 0.006
     long_trim_seconds: float = 0.010
     trim_switch_seconds: float = 0.20
@@ -87,6 +94,11 @@ class HardMuteCleanupConfig:
     trim_end_seconds: float = 0.02
     min_window_seconds: float = 0.05
     fade_ms: float = 0.0
+    protected_silence_max_seconds: float = 0.42
+    protected_neighbor_min_seconds: float = 0.08
+    protected_neighbor_max_seconds: float = 0.75
+    protected_neighbor_peak_db: float = -18.0
+    protected_neighbor_rms_db: float = -30.0
 
 
 @dataclass(frozen=True)
@@ -395,17 +407,84 @@ def build_bridge_cleanup_windows_from_silences(
     samples: array,
     sample_rate: int,
     config: BridgeCleanupConfig,
-) -> tuple[list[NoiseWindow], list[dict[str, float | bool]]]:
-    seed_windows = [
-        NoiseWindow(
+) -> tuple[
+    list[NoiseWindow],
+    list[dict[str, float | bool]],
+    list[dict[str, float | bool | None | str]],
+]:
+    seed_windows: list[NoiseWindow] = []
+    seed_debug: list[dict[str, float | bool | None | str]] = []
+    total_samples = len(samples)
+    for item in silences:
+        duration_seconds = float(item["duration_seconds"])
+        if duration_seconds < config.min_seed_silence_duration:
+            continue
+        window = NoiseWindow(
             start_seconds=float(item["start_seconds"]),
             end_seconds=float(item["end_seconds"]),
         )
-        for item in silences
-        if float(item["duration_seconds"]) >= config.min_seed_silence_duration
-    ]
+        protected = False
+        protection_reason: str | None = None
+        left_context_peak_db: float | None = None
+        left_context_rms_db: float | None = None
+        right_context_peak_db: float | None = None
+        right_context_rms_db: float | None = None
+        if duration_seconds <= config.protected_silence_max_seconds:
+            left_start_index = max(
+                0,
+                int((window.start_seconds - config.protected_context_probe_seconds) * sample_rate),
+            )
+            left_end_index = max(0, min(total_samples, int(window.start_seconds * sample_rate)))
+            right_start_index = max(0, min(total_samples, int(window.end_seconds * sample_rate)))
+            right_end_index = max(
+                right_start_index,
+                min(total_samples, int((window.end_seconds + config.protected_context_probe_seconds) * sample_rate)),
+            )
+            if left_end_index > left_start_index and right_end_index > right_start_index:
+                left_context_peak_db, left_context_rms_db = measure_segment_levels(
+                    samples,
+                    start_index=left_start_index,
+                    end_index=left_end_index,
+                )
+                right_context_peak_db, right_context_rms_db = measure_segment_levels(
+                    samples,
+                    start_index=right_start_index,
+                    end_index=right_end_index,
+                )
+                if (
+                    left_context_peak_db >= config.protected_context_peak_db
+                    and left_context_rms_db >= config.protected_context_rms_db
+                    and right_context_peak_db >= config.protected_context_peak_db
+                    and right_context_rms_db >= config.protected_context_rms_db
+                ):
+                    protected = True
+                    protection_reason = "continuous_speech_context"
+
+        seed_debug.append(
+            {
+                "seed_start_seconds": round(window.start_seconds, 3),
+                "seed_end_seconds": round(window.end_seconds, 3),
+                "seed_duration_seconds": round(duration_seconds, 3),
+                "protected": protected,
+                "protection_reason": protection_reason,
+                "left_context_peak_db": (
+                    round(left_context_peak_db, 3) if left_context_peak_db is not None else None
+                ),
+                "left_context_rms_db": (
+                    round(left_context_rms_db, 3) if left_context_rms_db is not None else None
+                ),
+                "right_context_peak_db": (
+                    round(right_context_peak_db, 3) if right_context_peak_db is not None else None
+                ),
+                "right_context_rms_db": (
+                    round(right_context_rms_db, 3) if right_context_rms_db is not None else None
+                ),
+            }
+        )
+        if not protected:
+            seed_windows.append(window)
     if not seed_windows:
-        return [], []
+        return [], [], seed_debug
 
     merged_seed_windows: list[NoiseWindow] = []
     merged_seed_counts: list[int] = []
@@ -430,7 +509,12 @@ def build_bridge_cleanup_windows_from_silences(
                 start_index=int(previous.end_seconds * sample_rate),
                 end_index=int(window.start_seconds * sample_rate),
             )
-            if peak_db <= config.bridge_peak_db and rms_db <= config.bridge_rms_db:
+            bridge_peak_limit = config.bridge_peak_db
+            bridge_rms_limit = config.bridge_rms_db
+            if gap_seconds >= config.protected_gap_seconds:
+                bridge_peak_limit = min(bridge_peak_limit, config.protected_bridge_peak_db)
+                bridge_rms_limit = min(bridge_rms_limit, config.protected_bridge_rms_db)
+            if peak_db <= bridge_peak_limit and rms_db <= bridge_rms_limit:
                 merge_allowed = True
 
         merge_debug.append(
@@ -441,6 +525,8 @@ def build_bridge_cleanup_windows_from_silences(
                 "merged": merge_allowed,
                 "gap_peak_db": round(peak_db, 3) if peak_db is not None else None,
                 "gap_rms_db": round(rms_db, 3) if rms_db is not None else None,
+                "bridge_peak_limit_db": round(bridge_peak_limit, 3) if peak_db is not None else None,
+                "bridge_rms_limit_db": round(bridge_rms_limit, 3) if rms_db is not None else None,
             }
         )
 
@@ -475,7 +561,7 @@ def build_bridge_cleanup_windows_from_silences(
                     end_seconds=end_seconds,
                 )
             )
-    return final_windows, merge_debug
+    return final_windows, merge_debug, seed_debug
 
 
 def apply_bridge_cleanup_to_file(
@@ -492,7 +578,7 @@ def apply_bridge_cleanup_to_file(
         min_duration=config.silence_min_duration,
     )
     params, samples = _load_wave_samples(input_wav)
-    windows, merge_debug = build_bridge_cleanup_windows_from_silences(
+    windows, merge_debug, seed_debug = build_bridge_cleanup_windows_from_silences(
         silences,
         samples=samples,
         sample_rate=params.framerate,
@@ -509,6 +595,8 @@ def apply_bridge_cleanup_to_file(
     return {
         "silence_candidate_count": len(silences),
         "mute_window_count": len(windows),
+        "protected_seed_count": sum(1 for item in seed_debug if item["protected"]),
+        "seed_debug": seed_debug,
         "merge_debug": merge_debug,
         "mute_windows": [
             {
@@ -525,21 +613,104 @@ def apply_bridge_cleanup_to_file(
 def build_hardmute_cleanup_windows_from_silences(
     silences: list[dict[str, float]],
     *,
+    samples: array,
+    sample_rate: int,
     config: HardMuteCleanupConfig,
-) -> list[NoiseWindow]:
-    windows: list[NoiseWindow] = []
-    for item in silences:
-        start_seconds = float(item["start_seconds"]) + config.trim_start_seconds
-        end_seconds = float(item["end_seconds"]) - config.trim_end_seconds
-        if end_seconds - start_seconds < config.min_window_seconds:
-            continue
-        windows.append(
-            NoiseWindow(
-                start_seconds=start_seconds,
-                end_seconds=end_seconds,
-            )
+) -> tuple[list[NoiseWindow], list[dict[str, float | bool | None | str]]]:
+    silence_windows = [
+        NoiseWindow(
+            start_seconds=float(item["start_seconds"]),
+            end_seconds=float(item["end_seconds"]),
         )
-    return windows
+        for item in silences
+    ]
+    windows: list[NoiseWindow] = []
+    debug_items: list[dict[str, float | bool | None | str]] = []
+    for index, window in enumerate(silence_windows):
+        raw_duration_seconds = window.end_seconds - window.start_seconds
+        start_seconds = window.start_seconds + config.trim_start_seconds
+        end_seconds = window.end_seconds - config.trim_end_seconds
+        trimmed_duration_seconds = end_seconds - start_seconds
+        protected = False
+        protection_reason: str | None = None
+        left_gap_duration_seconds: float | None = None
+        right_gap_duration_seconds: float | None = None
+        left_gap_peak_db: float | None = None
+        left_gap_rms_db: float | None = None
+        right_gap_peak_db: float | None = None
+        right_gap_rms_db: float | None = None
+
+        if 0 < index < (len(silence_windows) - 1):
+            previous = silence_windows[index - 1]
+            following = silence_windows[index + 1]
+            left_gap_duration_seconds = window.start_seconds - previous.end_seconds
+            right_gap_duration_seconds = following.start_seconds - window.end_seconds
+            if (
+                raw_duration_seconds <= config.protected_silence_max_seconds
+                and config.protected_neighbor_min_seconds
+                <= left_gap_duration_seconds
+                <= config.protected_neighbor_max_seconds
+                and config.protected_neighbor_min_seconds
+                <= right_gap_duration_seconds
+                <= config.protected_neighbor_max_seconds
+            ):
+                left_gap_peak_db, left_gap_rms_db = measure_segment_levels(
+                    samples,
+                    start_index=int(previous.end_seconds * sample_rate),
+                    end_index=int(window.start_seconds * sample_rate),
+                )
+                right_gap_peak_db, right_gap_rms_db = measure_segment_levels(
+                    samples,
+                    start_index=int(window.end_seconds * sample_rate),
+                    end_index=int(following.start_seconds * sample_rate),
+                )
+                if (
+                    left_gap_peak_db >= config.protected_neighbor_peak_db
+                    and left_gap_rms_db >= config.protected_neighbor_rms_db
+                    and right_gap_peak_db >= config.protected_neighbor_peak_db
+                    and right_gap_rms_db >= config.protected_neighbor_rms_db
+                ):
+                    protected = True
+                    protection_reason = "continuous_speech_neighbors"
+
+        applied = False
+        if not protected and trimmed_duration_seconds >= config.min_window_seconds:
+            windows.append(
+                NoiseWindow(
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                )
+            )
+            applied = True
+
+        debug_items.append(
+            {
+                "silence_start_seconds": round(window.start_seconds, 3),
+                "silence_end_seconds": round(window.end_seconds, 3),
+                "silence_duration_seconds": round(raw_duration_seconds, 3),
+                "trimmed_start_seconds": round(start_seconds, 3),
+                "trimmed_end_seconds": round(end_seconds, 3),
+                "trimmed_duration_seconds": round(trimmed_duration_seconds, 3),
+                "applied": applied,
+                "protected": protected,
+                "protection_reason": protection_reason,
+                "left_gap_duration_seconds": (
+                    round(left_gap_duration_seconds, 3)
+                    if left_gap_duration_seconds is not None
+                    else None
+                ),
+                "right_gap_duration_seconds": (
+                    round(right_gap_duration_seconds, 3)
+                    if right_gap_duration_seconds is not None
+                    else None
+                ),
+                "left_gap_peak_db": round(left_gap_peak_db, 3) if left_gap_peak_db is not None else None,
+                "left_gap_rms_db": round(left_gap_rms_db, 3) if left_gap_rms_db is not None else None,
+                "right_gap_peak_db": round(right_gap_peak_db, 3) if right_gap_peak_db is not None else None,
+                "right_gap_rms_db": round(right_gap_rms_db, 3) if right_gap_rms_db is not None else None,
+            }
+        )
+    return windows, debug_items
 
 
 def apply_hardmute_cleanup_to_file(
@@ -555,8 +726,11 @@ def apply_hardmute_cleanup_to_file(
         threshold_db=config.silence_threshold_db,
         min_duration=config.silence_min_duration,
     )
-    windows = build_hardmute_cleanup_windows_from_silences(
+    params, samples = _load_wave_samples(input_wav)
+    windows, debug_items = build_hardmute_cleanup_windows_from_silences(
         silences,
+        samples=samples,
+        sample_rate=params.framerate,
         config=config,
     )
     shutil.copy2(input_wav, output_wav)
@@ -570,6 +744,7 @@ def apply_hardmute_cleanup_to_file(
     return {
         "silence_count": len(silences),
         "window_count": len(windows),
+        "protected_window_count": sum(1 for item in debug_items if item["protected"]),
         "total_window_ms": round(
             sum((window.end_seconds - window.start_seconds) * 1000.0 for window in windows),
             1,
@@ -583,6 +758,7 @@ def apply_hardmute_cleanup_to_file(
             for window in windows
             if window.start_seconds < 30.0
         ],
+        "debug_items": debug_items,
         "config": asdict(config),
     }
 
@@ -916,6 +1092,9 @@ def _legacy_reference_bridge_config() -> BridgeCleanupConfig:
         bridge_gap_seconds=0.14,
         bridge_peak_db=-14.0,
         bridge_rms_db=-22.0,
+        protected_gap_seconds=0.075,
+        protected_bridge_peak_db=-22.0,
+        protected_bridge_rms_db=-30.0,
         short_trim_seconds=0.004,
         long_trim_seconds=0.008,
         trim_switch_seconds=0.18,
@@ -1032,6 +1211,7 @@ def run_skill_workflow(
                 skip_bridge_cleanup=skip_bridge_cleanup or not mode.apply_bridge_cleanup,
                 spectrogram_start=spectrogram_start,
                 spectrogram_duration=spectrogram_duration,
+                run_slug=run_slug,
             )
         )
 
@@ -1157,6 +1337,7 @@ def _finalize_workflow_file(
     skip_bridge_cleanup: bool,
     spectrogram_start: float,
     spectrogram_duration: float,
+    run_slug: str,
 ) -> dict[str, Any]:
     if mode.name == "reference-legacy":
         return _finalize_reference_legacy_file(
@@ -1170,6 +1351,7 @@ def _finalize_workflow_file(
             skip_spectrograms=skip_spectrograms,
             spectrogram_start=spectrogram_start,
             spectrogram_duration=spectrogram_duration,
+            run_slug=run_slug,
         )
 
     input_file = Path(core_report["input_file"])
@@ -1182,6 +1364,7 @@ def _finalize_workflow_file(
     transcript_dir = Path(outputs["transcript_dir"])
     workflow_dir = preprocess_dir / "workflow_artifacts"
     workflow_dir.mkdir(parents=True, exist_ok=True)
+    delivery_label = _delivery_label(input_file.stem, mode.suffix, run_slug)
 
     delivered_wav = clean_wav
     delivered_mp3 = transcript_mp3
@@ -1190,7 +1373,7 @@ def _finalize_workflow_file(
     residue_cleanup_report: dict[str, Any] | None = None
     exact_cleanup_report: dict[str, Any] | None = None
     if mode.apply_narrow_cleanup:
-        narrow_cleanup_output = preprocess_dir / f"{input_file.stem}_clean_{mode.suffix}_narrow.wav"
+        narrow_cleanup_output = preprocess_dir / f"{delivery_label}_narrow.wav"
         narrow_cleanup_report = apply_narrow_cleanup_to_file(
             clean_wav,
             narrow_cleanup_output,
@@ -1199,7 +1382,7 @@ def _finalize_workflow_file(
         delivered_wav = narrow_cleanup_output
     if not skip_bridge_cleanup:
         bridge_source = delivered_wav
-        delivered_wav = preprocess_dir / f"{input_file.stem}_clean_{mode.suffix}_bridge.wav"
+        delivered_wav = preprocess_dir / f"{delivery_label}_bridge.wav"
         bridge_cleanup_report = apply_bridge_cleanup_to_file(
             bridge_source,
             delivered_wav,
@@ -1208,7 +1391,7 @@ def _finalize_workflow_file(
         )
     if mode.apply_narrow_cleanup:
         residue_source = delivered_wav
-        delivered_wav = preprocess_dir / f"{input_file.stem}_clean_{mode.suffix}.wav"
+        delivered_wav = preprocess_dir / f"{delivery_label}.wav"
         residue_cleanup_report = apply_residue_cleanup_to_file(
             residue_source,
             delivered_wav,
@@ -1217,7 +1400,7 @@ def _finalize_workflow_file(
         )
     if exact_mute_windows or exact_duck_windows:
         exact_source = delivered_wav
-        delivered_wav = preprocess_dir / f"{input_file.stem}_clean_{mode.suffix}_精修版.wav"
+        delivered_wav = preprocess_dir / f"{delivery_label}_精修版.wav"
         exact_cleanup_report = apply_exact_cleanup_to_file(
             exact_source,
             delivered_wav,
@@ -1225,10 +1408,10 @@ def _finalize_workflow_file(
             duck_windows=exact_duck_windows,
         )
     if mode.apply_narrow_cleanup or not skip_bridge_cleanup:
-        delivered_mp3 = transcript_dir / f"{input_file.stem}_clean_{mode.suffix}.mp3"
+        delivered_mp3 = transcript_dir / f"{delivery_label}.mp3"
         _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
     if exact_cleanup_report:
-        delivered_mp3 = transcript_dir / f"{input_file.stem}_clean_{mode.suffix}_精修版.mp3"
+        delivered_mp3 = transcript_dir / f"{delivery_label}_精修版.mp3"
         _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
 
     spectrograms: dict[str, str] = {}
@@ -1336,6 +1519,7 @@ def _finalize_reference_legacy_file(
     skip_spectrograms: bool,
     spectrogram_start: float,
     spectrogram_duration: float,
+    run_slug: str,
 ) -> dict[str, Any]:
     input_file = Path(core_report["input_file"])
     outputs = core_report["outputs"]
@@ -1346,14 +1530,15 @@ def _finalize_reference_legacy_file(
     transcript_dir = Path(outputs["transcript_dir"])
     workflow_dir = preprocess_dir / "workflow_artifacts"
     workflow_dir.mkdir(parents=True, exist_ok=True)
+    delivery_label = _delivery_label(input_file.stem, mode.suffix, run_slug)
 
     preview_a_output = preprocess_dir / f"{input_file.stem}_clean_停顿残留加强版A.wav"
     preview_b_output = preprocess_dir / f"{input_file.stem}_clean_停顿残留加强版B.wav"
     extreme_output = preprocess_dir / f"{input_file.stem}_clean_极限停顿清理版.wav"
     hardmute_output = preprocess_dir / "hardmute_pause_tmp.wav"
     bridge_tmp_output = preprocess_dir / "bridgeclean_tmp.wav"
-    delivered_wav = preprocess_dir / f"{input_file.stem}_clean_{mode.suffix}.wav"
-    delivered_mp3 = transcript_dir / f"{input_file.stem}_clean_{mode.suffix}.mp3"
+    delivered_wav = preprocess_dir / f"{delivery_label}.wav"
+    delivered_mp3 = transcript_dir / f"{delivery_label}.mp3"
     exact_cleanup_report: dict[str, Any] | None = None
 
     narrow_cleanup_a_report = apply_narrow_cleanup_to_file(
@@ -1400,7 +1585,7 @@ def _finalize_reference_legacy_file(
 
     shutil.copy2(bridge_tmp_output, delivered_wav)
     if exact_mute_windows or exact_duck_windows:
-        exact_output = preprocess_dir / f"{input_file.stem}_clean_{mode.suffix}_精修版.wav"
+        exact_output = preprocess_dir / f"{delivery_label}_精修版.wav"
         exact_cleanup_report = apply_exact_cleanup_to_file(
             delivered_wav,
             exact_output,
@@ -1410,7 +1595,7 @@ def _finalize_reference_legacy_file(
         delivered_wav = exact_output
     _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
     if exact_cleanup_report:
-        delivered_mp3 = transcript_dir / f"{input_file.stem}_clean_{mode.suffix}_精修版.mp3"
+        delivered_mp3 = transcript_dir / f"{delivery_label}_精修版.mp3"
         _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
 
     spectrograms: dict[str, str] = {}
@@ -1649,6 +1834,10 @@ def _window_suffix(start_seconds: float, duration_seconds: float) -> str:
     start_label = _format_seconds(start_seconds).replace(".", "_")
     duration_label = _format_seconds(duration_seconds).replace(".", "_")
     return f"{start_label}_{duration_label}"
+
+
+def _delivery_label(input_stem: str, mode_suffix: str, run_slug: str) -> str:
+    return f"{input_stem}_clean_{mode_suffix}_{run_slug}"
 
 
 def _slug_label(value: str) -> str:
