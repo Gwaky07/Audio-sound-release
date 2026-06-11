@@ -48,7 +48,7 @@ Legacy FFmpeg breath ducking and breath-onset cleanup are still available as com
 
 ## Prerequisites
 
-- Python 3.10 or 3.11
+- Python 3.10+
 - `ffmpeg`
 - `ffprobe`
 
@@ -64,8 +64,6 @@ Optional external assets for the breath-first path:
 
 - local `Respiro-en` repository checkout
 - local `respiro-en.pt` model weights
-
-This repository is distributed as source code, not as a bundled runtime package. Local virtual environments, `.env` files, Respiro-en checkouts, model weights, generated audio, and Codex runtime state are intentionally excluded and must be prepared per machine.
 
 ## Quick start
 
@@ -87,18 +85,6 @@ Install recommended local runtime packages:
 python scripts/audio_cleanup.py setup
 ```
 
-Remove generated outputs and local machine state from the repository:
-
-```bash
-python scripts/audio_cleanup.py clean-repo
-```
-
-Preview what would be removed first:
-
-```bash
-python scripts/audio_cleanup.py clean-repo --dry-run
-```
-
 Install real Respiro-en assets locally and write `.env` automatically:
 
 ```bash
@@ -109,12 +95,6 @@ Or on Windows, use the repo helper which creates `.venv` first:
 
 ```bash
 setup.cmd
-```
-
-To verify a clean checkout on Windows:
-
-```bash
-doctor.cmd
 ```
 
 Inspect one file:
@@ -134,6 +114,15 @@ Run the final-delivery stable repository workflow:
 ```bash
 python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav"
 ```
+
+Final WAV/MP3 files are copied to `output/修音成品/` by default. The user-facing name is:
+
+```text
+修音版_<原音频文件名>.wav
+修音版_<原音频文件名>.mp3
+```
+
+If that name already exists, the workflow writes the next version as `_01`, `_02`, and so on. Internal stage audio is removed by default after the report, metrics, and spectrogram artifacts are written. Use `--keep-intermediate-audio` only when troubleshooting a specific processing stage.
 
 Installed entrypoint for the same final-delivery workflow:
 
@@ -229,49 +218,49 @@ python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --focus-wind
 
 ## Output layout
 
-Default runs write to `output/run-<timestamp>/`.
+Default skill runs write two kinds of output:
 
-Each input file gets an ASCII-only job folder:
+- `output/修音成品/`
+  - final user-facing WAV/MP3 only
+  - names are `修音版_<原音频文件名>.wav|mp3`
+  - repeated runs for the same source become `修音版_<原音频文件名>_01.wav|mp3`, then `_02`, etc.
+- `output/skill-<timestamp>_<source>/`
+  - workflow reports, metrics, and spectrogram evidence
+  - internal stage audio is removed by default to avoid confusing the final result
+
+Example final delivery folder:
 
 ```text
-output/run-20260527-120000/
-  20260527-120000_voice_take_01/
-    audio_preprocess/
-      audio_raw.wav
-      audio_df.wav
-      audio_clean.wav
-      audio_process_report.json
-      audio_process_report.md
-      deepfilternet_out/
-    transcript_ready/
-      audio.mp3
+output/修音成品/
+  修音版_女生（测试2）.wav
+  修音版_女生（测试2）.mp3
+  修音版_女生（测试2）_01.wav
+  修音版_女生（测试2）_01.mp3
 ```
 
-Batch summary files are written at the run root:
+Troubleshooting output remains under the run root:
 
-- `batch-summary.json`
-- `batch-summary.md`
+```text
+output/skill-20260611-081223_女生-测试2/
+  batch-summary.json
+  batch-summary.md
+  skill-workflow-summary.json
+  skill-workflow-summary.md
+  20260611-081223_女生（测试2）/
+    audio_preprocess/
+      audio_process_report.json
+      audio_process_report.md
+      workflow_artifacts/
+        skill-file-report.json
+        skill-file-report.md
+        spectrograms/
+```
 
-## Handoff
+When you need to inspect raw, DeepFilterNet, mastered, or bridge-clean audio stages, run:
 
-For the cleanest shareable repository:
-
-1. Run `python scripts/audio_cleanup.py clean-repo --dry-run`
-2. Run `python scripts/audio_cleanup.py clean-repo`
-3. Share the repository without `.venv/`, `output/`, `scratch/`, `.omx/`, `.worktrees/`, or cache folders
-
-For the receiving machine:
-
-1. Install Python 3.10 or 3.11, `ffmpeg`, and `ffprobe`
-2. Run `setup.cmd`
-3. Run `python scripts/audio_cleanup.py setup-respiro`
-4. Run `doctor.cmd`
-5. Confirm `doctor` reports `deepfilternet`, `respiro_en`, and `spectramini` as available before expecting full-quality output
-6. Keep source media outside the repository when possible, or use `scratch/` for temporary local work
-
-The repository is meant to stay source-only. Generated audio, reports, and temporary review files should remain under ignored working directories such as `output/` or `scratch/`.
-
-If a fully offline or double-click-ready delivery is required later, prepare that as a separate release package outside the repository and keep local assets out of git.
+```bash
+python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --keep-intermediate-audio
+```
 
 ## Codex usage
 
@@ -282,6 +271,8 @@ Default rule:
 - In this repository, if you ask Codex to process or clean audio, it should treat that as a request for the final usable version by default.
 - The default target is the approved strict spoken-word finish: remove breaths, gasps, saliva noise, pause residue, and room noise as cleanly as possible, keep loudness and peak in the approved range, preserve Chinese filenames, and deliver directly usable WAV/MP3 outputs.
 - Unless you explicitly ask for another mode, Codex should prefer `reference-legacy` and continue with node inspection plus exact repair until the result is clean enough to deliver.
+- Final audio should be taken from `output/修音成品/`, not from `audio_preprocess/`.
+- The final naming rule is `修音版_<原音频文件名>.wav|mp3`; repeated runs append `_01`, `_02`, etc.
 - For final delivery, prefer `audio-skill-workflow run ...` or `python scripts/audio_skill_workflow.py run ...`; keep `audio_cleanup.py clean` for lower-level preset control, inspection, setup, and compatibility paths.
 
 Recommended Chinese prompts:

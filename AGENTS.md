@@ -43,7 +43,10 @@ Do not claim Respiro-en, DeepFilterNet, or SpectraMini were used unless `doctor`
 
 ## Delivery Rules
 
-- Preserve the original Chinese filename and append the cleanup suffix plus the run identifier.
+- Final user-facing audio must be delivered under `output/修音成品/`.
+- Preserve the original Chinese filename with the naming rule `修音版_<原音频文件名>.wav|mp3`.
+- If the final name already exists, use `_01`, `_02`, and so on. Do not rely on timestamp folders alone.
+- Remove internal WAV/MP3 stage files by default after reports and spectrograms are written. Use `--keep-intermediate-audio` only for troubleshooting.
 - Produce final WAV and MP3 outputs.
 - Generate and review spectrogram evidence for strict cleanup work.
 - If a specific timestamp still has breath, saliva noise, pause residue, or thin artifacts, inspect that local region first and then use exact narrow-window repair.

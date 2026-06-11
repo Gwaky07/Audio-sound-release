@@ -17,6 +17,9 @@ from audio_sound.skill_workflow import (
     build_residue_cleanup_windows_from_silences,
     describe_modes,
     _delivery_label,
+    _final_delivery_label,
+    _prune_intermediate_audio,
+    _reserve_delivery_paths,
     parse_focus_window,
     resolve_mode,
 )
@@ -57,6 +60,60 @@ class SkillWorkflowTests(unittest.TestCase):
     def test_delivery_label_preserves_chinese_name_and_adds_run_slug(self) -> None:
         label = _delivery_label("女生（测试2）", "细丝桥接清理版", "20260610-162806")
         self.assertEqual(label, "女生（测试2）_clean_细丝桥接清理版_20260610-162806")
+
+    def test_final_delivery_label_uses_repair_prefix_and_original_name(self) -> None:
+        label = _final_delivery_label("女生（测试2）")
+        self.assertEqual(label, "修音版_女生（测试2）")
+
+    def test_reserve_delivery_paths_increments_when_final_name_exists(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delivery_dir = Path(tmp_dir)
+            (delivery_dir / "修音版_女生（测试2）.wav").write_bytes(b"old wav")
+            (delivery_dir / "修音版_女生（测试2）.mp3").write_bytes(b"old mp3")
+
+            wav_path, mp3_path = _reserve_delivery_paths(delivery_dir, "女生（测试2）")
+
+            self.assertEqual(wav_path.name, "修音版_女生（测试2）_01.wav")
+            self.assertEqual(mp3_path.name, "修音版_女生（测试2）_01.mp3")
+
+    def test_prune_intermediate_audio_removes_internal_audio_but_keeps_reports(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            preprocess_dir = root / "audio_preprocess"
+            transcript_dir = root / "transcript_ready"
+            preprocess_dir.mkdir()
+            transcript_dir.mkdir()
+            report_path = preprocess_dir / "audio_process_report.json"
+            for path in (
+                preprocess_dir / "raw.wav",
+                preprocess_dir / "clean.wav",
+                transcript_dir / "preview.mp3",
+            ):
+                path.write_bytes(b"audio")
+            report_path.write_text("{}", encoding="utf-8")
+
+            removed = _prune_intermediate_audio(
+                [
+                    {
+                        "core_outputs": {
+                            "preprocess_dir": str(preprocess_dir),
+                            "transcript_dir": str(transcript_dir),
+                        }
+                    }
+                ]
+            )
+
+            self.assertEqual(len(removed), 3)
+            self.assertFalse((preprocess_dir / "raw.wav").exists())
+            self.assertFalse((preprocess_dir / "clean.wav").exists())
+            self.assertFalse((transcript_dir / "preview.mp3").exists())
+            self.assertTrue(report_path.exists())
 
     def test_parse_exact_mute_window_accepts_start_end(self) -> None:
         window = parse_exact_mute_window("234.452,235.457")

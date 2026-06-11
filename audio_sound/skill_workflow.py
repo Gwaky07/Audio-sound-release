@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import shutil
 import wave
 from array import array
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -197,6 +199,20 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("input_path")
     run_parser.add_argument("--mode", default="reference-legacy", choices=sorted(WORKFLOW_MODES))
     run_parser.add_argument("--output-dir")
+    run_parser.add_argument(
+        "--delivery-dir",
+        help="Directory for final user-facing audio. Defaults to output/修音成品.",
+    )
+    run_parser.add_argument(
+        "--delivery-prefix",
+        default="修音版",
+        help="Prefix for final user-facing audio names.",
+    )
+    run_parser.add_argument(
+        "--keep-intermediate-audio",
+        action="store_true",
+        help="Keep internal WAV/MP3 stage files for troubleshooting.",
+    )
     run_parser.add_argument("--recursive", action="store_true")
     run_parser.add_argument("--target-lufs", type=float)
     run_parser.add_argument("--attenuation-db", type=float)
@@ -1150,6 +1166,9 @@ def run_skill_workflow(
     exact_duck_windows: Sequence[ExactDuckWindow],
     skip_spectrograms: bool,
     skip_bridge_cleanup: bool,
+    delivery_dir: Path | None,
+    delivery_prefix: str,
+    keep_intermediate_audio: bool,
     spectrogram_start: float,
     spectrogram_duration: float,
 ) -> dict[str, Any]:
@@ -1163,6 +1182,8 @@ def run_skill_workflow(
         else PROJECT_ROOT / "output" / f"skill-{run_slug}_{_slug_label(input_path.stem or input_path.name)}"
     )
     workflow_root.mkdir(parents=True, exist_ok=True)
+    resolved_delivery_dir = delivery_dir if delivery_dir is not None else PROJECT_ROOT / "output" / "修音成品"
+    resolved_delivery_dir.mkdir(parents=True, exist_ok=True)
 
     cli_args = [
         "clean",
@@ -1188,8 +1209,18 @@ def run_skill_workflow(
     for noise_window in noise_windows:
         cli_args.extend(["--noise-window", noise_window])
 
-    exit_code = audio_cleanup_main(cli_args)
+    lower_level_stdout = io.StringIO()
+    lower_level_stderr = io.StringIO()
+    with redirect_stdout(lower_level_stdout), redirect_stderr(lower_level_stderr):
+        exit_code = audio_cleanup_main(cli_args)
     if exit_code != 0:
+        details = "\n".join(
+            part.strip()
+            for part in (lower_level_stdout.getvalue(), lower_level_stderr.getvalue())
+            if part.strip()
+        )
+        if details:
+            raise RuntimeError(f"audio cleanup workflow failed with exit code {exit_code}\n{details}")
         raise RuntimeError(f"audio cleanup workflow failed with exit code {exit_code}")
 
     batch_summary_path = workflow_root / "batch-summary.json"
@@ -1209,6 +1240,8 @@ def run_skill_workflow(
                 exact_duck_windows=exact_duck_windows,
                 skip_spectrograms=skip_spectrograms,
                 skip_bridge_cleanup=skip_bridge_cleanup or not mode.apply_bridge_cleanup,
+                delivery_dir=resolved_delivery_dir,
+                delivery_prefix=delivery_prefix,
                 spectrogram_start=spectrogram_start,
                 spectrogram_duration=spectrogram_duration,
                 run_slug=run_slug,
@@ -1218,12 +1251,21 @@ def run_skill_workflow(
     summary = {
         "mode": asdict(mode),
         "workflow_root": str(workflow_root),
+        "delivery_dir": str(resolved_delivery_dir),
         "input_path": str(input_path),
         "recursive": recursive,
+        "intermediate_audio_retained": keep_intermediate_audio,
+        "lower_level_stdout": lower_level_stdout.getvalue(),
+        "lower_level_stderr": lower_level_stderr.getvalue(),
         "processing_order": _processing_order_for_mode(mode),
         "files": files,
         "core_batch_summary": batch_summary,
     }
+    if keep_intermediate_audio:
+        summary["intermediate_audio_removed"] = []
+    else:
+        summary["intermediate_audio_removed"] = _prune_intermediate_audio(files)
+
     (workflow_root / "skill-workflow-summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -1243,6 +1285,8 @@ def render_skill_workflow_markdown(summary: dict[str, Any]) -> str:
         f"- Base preset: `{summary['mode']['preset_name']}`",
         f"- Input path: `{summary['input_path']}`",
         f"- Workflow root: `{summary['workflow_root']}`",
+        f"- Final delivery dir: `{summary['delivery_dir']}`",
+        f"- Intermediate audio retained: `{summary['intermediate_audio_retained']}`",
         "",
         "## Processing Order",
     ]
@@ -1253,8 +1297,8 @@ def render_skill_workflow_markdown(summary: dict[str, Any]) -> str:
         lines.extend(
             [
                 f"- `{item['input_file']}`",
-                f"  - delivered wav: `{item['deliverables']['wav']}`",
-                f"  - delivered mp3: `{item['deliverables']['mp3']}`",
+                f"  - final wav: `{item['deliverables']['wav']}`",
+                f"  - final mp3: `{item['deliverables']['mp3']}`",
                 f"  - workflow report: `{item['workflow_report_json']}`",
             ]
         )
@@ -1283,12 +1327,18 @@ def command_run(args: argparse.Namespace) -> int:
         exact_duck_windows=[parse_exact_duck_window(value) for value in args.exact_duck_window],
         skip_spectrograms=args.skip_spectrograms,
         skip_bridge_cleanup=args.skip_bridge_cleanup,
+        delivery_dir=Path(args.delivery_dir) if args.delivery_dir else None,
+        delivery_prefix=args.delivery_prefix,
+        keep_intermediate_audio=args.keep_intermediate_audio,
         spectrogram_start=args.spectrogram_start,
         spectrogram_duration=args.spectrogram_duration,
     )
     print(f"Workflow root: {summary['workflow_root']}")
+    print(f"Final delivery dir: {summary['delivery_dir']}")
     for item in summary["files"]:
         print(f"- {item['input_file']} -> {item['deliverables']['wav']}")
+    if not summary["intermediate_audio_retained"]:
+        print(f"Removed intermediate audio files: {len(summary['intermediate_audio_removed'])}")
     return 0
 
 
@@ -1335,6 +1385,8 @@ def _finalize_workflow_file(
     exact_duck_windows: Sequence[ExactDuckWindow],
     skip_spectrograms: bool,
     skip_bridge_cleanup: bool,
+    delivery_dir: Path,
+    delivery_prefix: str,
     spectrogram_start: float,
     spectrogram_duration: float,
     run_slug: str,
@@ -1349,6 +1401,8 @@ def _finalize_workflow_file(
             exact_mute_windows=exact_mute_windows,
             exact_duck_windows=exact_duck_windows,
             skip_spectrograms=skip_spectrograms,
+            delivery_dir=delivery_dir,
+            delivery_prefix=delivery_prefix,
             spectrogram_start=spectrogram_start,
             spectrogram_duration=spectrogram_duration,
             run_slug=run_slug,
@@ -1365,9 +1419,14 @@ def _finalize_workflow_file(
     workflow_dir = preprocess_dir / "workflow_artifacts"
     workflow_dir.mkdir(parents=True, exist_ok=True)
     delivery_label = _delivery_label(input_file.stem, mode.suffix, run_slug)
+    final_wav, final_mp3 = _reserve_delivery_paths(
+        delivery_dir,
+        input_file.stem,
+        delivery_prefix=delivery_prefix,
+    )
 
     delivered_wav = clean_wav
-    delivered_mp3 = transcript_mp3
+    internal_mp3 = transcript_mp3
     narrow_cleanup_report: dict[str, Any] | None = None
     bridge_cleanup_report: dict[str, Any] | None = None
     residue_cleanup_report: dict[str, Any] | None = None
@@ -1407,12 +1466,10 @@ def _finalize_workflow_file(
             mute_windows=exact_mute_windows,
             duck_windows=exact_duck_windows,
         )
-    if mode.apply_narrow_cleanup or not skip_bridge_cleanup:
-        delivered_mp3 = transcript_dir / f"{delivery_label}.mp3"
-        _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
-    if exact_cleanup_report:
-        delivered_mp3 = transcript_dir / f"{delivery_label}_精修版.mp3"
-        _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
+    shutil.copy2(delivered_wav, final_wav)
+    _export_mp3_from_wav(final_wav, final_mp3, ffmpeg_bin=ffmpeg_bin)
+    delivered_wav = final_wav
+    delivered_mp3 = final_mp3
 
     spectrograms: dict[str, str] = {}
     if not skip_spectrograms:
@@ -1481,6 +1538,8 @@ def _finalize_workflow_file(
         "deliverables": {
             "wav": str(delivered_wav),
             "mp3": str(delivered_mp3),
+            "delivery_dir": str(delivery_dir),
+            "internal_mp3": str(internal_mp3),
         },
         "core_outputs": outputs,
         "spectrograms": spectrograms,
@@ -1517,6 +1576,8 @@ def _finalize_reference_legacy_file(
     exact_mute_windows: Sequence[NoiseWindow],
     exact_duck_windows: Sequence[ExactDuckWindow],
     skip_spectrograms: bool,
+    delivery_dir: Path,
+    delivery_prefix: str,
     spectrogram_start: float,
     spectrogram_duration: float,
     run_slug: str,
@@ -1531,6 +1592,11 @@ def _finalize_reference_legacy_file(
     workflow_dir = preprocess_dir / "workflow_artifacts"
     workflow_dir.mkdir(parents=True, exist_ok=True)
     delivery_label = _delivery_label(input_file.stem, mode.suffix, run_slug)
+    final_wav, final_mp3 = _reserve_delivery_paths(
+        delivery_dir,
+        input_file.stem,
+        delivery_prefix=delivery_prefix,
+    )
 
     preview_a_output = preprocess_dir / f"{input_file.stem}_clean_停顿残留加强版A.wav"
     preview_b_output = preprocess_dir / f"{input_file.stem}_clean_停顿残留加强版B.wav"
@@ -1538,7 +1604,6 @@ def _finalize_reference_legacy_file(
     hardmute_output = preprocess_dir / "hardmute_pause_tmp.wav"
     bridge_tmp_output = preprocess_dir / "bridgeclean_tmp.wav"
     delivered_wav = preprocess_dir / f"{delivery_label}.wav"
-    delivered_mp3 = transcript_dir / f"{delivery_label}.mp3"
     exact_cleanup_report: dict[str, Any] | None = None
 
     narrow_cleanup_a_report = apply_narrow_cleanup_to_file(
@@ -1593,10 +1658,10 @@ def _finalize_reference_legacy_file(
             duck_windows=exact_duck_windows,
         )
         delivered_wav = exact_output
-    _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
-    if exact_cleanup_report:
-        delivered_mp3 = transcript_dir / f"{delivery_label}_精修版.mp3"
-        _export_mp3_from_wav(delivered_wav, delivered_mp3, ffmpeg_bin=ffmpeg_bin)
+    shutil.copy2(delivered_wav, final_wav)
+    _export_mp3_from_wav(final_wav, final_mp3, ffmpeg_bin=ffmpeg_bin)
+    delivered_wav = final_wav
+    delivered_mp3 = final_mp3
 
     spectrograms: dict[str, str] = {}
     if not skip_spectrograms:
@@ -1673,6 +1738,7 @@ def _finalize_reference_legacy_file(
         "deliverables": {
             "wav": str(delivered_wav),
             "mp3": str(delivered_mp3),
+            "delivery_dir": str(delivery_dir),
         },
         "core_outputs": outputs,
         "spectrograms": spectrograms,
@@ -1838,6 +1904,71 @@ def _window_suffix(start_seconds: float, duration_seconds: float) -> str:
 
 def _delivery_label(input_stem: str, mode_suffix: str, run_slug: str) -> str:
     return f"{input_stem}_clean_{mode_suffix}_{run_slug}"
+
+
+def _final_delivery_label(input_stem: str, delivery_prefix: str = "修音版") -> str:
+    safe_prefix = _safe_windows_stem(delivery_prefix) or "修音版"
+    safe_stem = _safe_windows_stem(input_stem) or "audio"
+    return f"{safe_prefix}_{safe_stem}"
+
+
+def _reserve_delivery_paths(
+    delivery_dir: Path,
+    input_stem: str,
+    *,
+    delivery_prefix: str = "修音版",
+) -> tuple[Path, Path]:
+    delivery_dir.mkdir(parents=True, exist_ok=True)
+    base_label = _final_delivery_label(input_stem, delivery_prefix)
+    for index in range(10000):
+        suffix = "" if index == 0 else f"_{index:02d}"
+        wav_path = delivery_dir / f"{base_label}{suffix}.wav"
+        mp3_path = delivery_dir / f"{base_label}{suffix}.mp3"
+        if not wav_path.exists() and not mp3_path.exists():
+            return wav_path, mp3_path
+    raise RuntimeError(f"Could not reserve a unique delivery filename under {delivery_dir}")
+
+
+def _safe_windows_stem(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", value.strip())
+    cleaned = cleaned.rstrip(" .")
+    return cleaned or "audio"
+
+
+def _prune_intermediate_audio(workflow_files: Sequence[dict[str, Any]]) -> list[str]:
+    removed: list[str] = []
+    suffixes = {".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg"}
+    for item in workflow_files:
+        core_outputs = item.get("core_outputs", {})
+        roots = [
+            Path(core_outputs["preprocess_dir"])
+            for key in ("preprocess_dir",)
+            if core_outputs.get(key)
+        ]
+        roots.extend(
+            Path(core_outputs[key])
+            for key in ("transcript_dir",)
+            if core_outputs.get(key)
+        )
+        for root in roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*")):
+                if path.is_file() and path.suffix.lower() in suffixes:
+                    path.unlink()
+                    removed.append(str(path))
+            _remove_empty_dirs(root)
+    return removed
+
+
+def _remove_empty_dirs(root: Path) -> None:
+    if not root.exists():
+        return
+    for directory in sorted((path for path in root.rglob("*") if path.is_dir()), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _slug_label(value: str) -> str:

@@ -20,6 +20,21 @@ python ../../../scripts/audio_skill_workflow.py describe-modes
 python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy
 ```
 
+最终音频默认只看：
+
+```text
+../../../output/修音成品/修音版_<原音频文件名>.wav
+../../../output/修音成品/修音版_<原音频文件名>.mp3
+```
+
+如果同名已存在，会自动生成 `_01`、`_02`。中间 wav/mp3 默认清理掉，只保留报告和频谱证据。
+
+如果要排查阶段问题，才保留中间音频：
+
+```bash
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --keep-intermediate-audio
+```
+
 ## 4. 更自然的低响度口播模式
 
 ```bash
@@ -45,7 +60,8 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode refe
 - `audio_process_report.json` 里的 `respiro_succeeded`
 - `audio_process_report.json` 里的 `deepfilternet_dropout_repair_windows`
 - `workflow_artifacts/spectrograms/focus/` 下的局部频谱图
-- 最终 WAV/MP3 文件名是否带运行编号
+- 最终 WAV/MP3 是否在 `output/修音成品/`
+- 最终 WAV/MP3 文件名是否是 `修音版_原名`，重名时是否递增 `_01/_02`
 
 ## 6. 同文件噪声窗口驱动的隔离模式
 
