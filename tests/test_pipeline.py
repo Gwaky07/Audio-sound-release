@@ -25,6 +25,7 @@ from audio_sound.pipeline import (
     build_respiro_detect_command,
     infer_pause_residual_cleanup_windows,
     measure_segment_levels,
+    repair_deepfilternet_speech_dropouts,
     resolve_respiro_runtime,
     run_respiro_or_fallback_detection,
     duck_samples_for_windows,
@@ -232,6 +233,102 @@ class PipelineTests(unittest.TestCase):
             fade_ms=0.0,
         )
         self.assertLess(max(abs(value) for value in cleaned), max(abs(value) for value in samples))
+
+    def test_repair_deepfilternet_speech_dropouts_restores_short_real_speech_window(self) -> None:
+        from array import array
+
+        sample_rate = 100
+        reference = array("h", [0] * 90)
+        for index in range(0, 20):
+            reference[index] = 5200
+        for index in range(20, 26):
+            reference[index] = 4200
+        for index in range(26, 50):
+            reference[index] = 5200
+        processed = array("h", reference)
+        for index in range(20, 26):
+            processed[index] = 120
+
+        repaired, windows = repair_deepfilternet_speech_dropouts(
+            reference,
+            processed,
+            sample_rate=sample_rate,
+            window_seconds=0.06,
+            hop_seconds=0.01,
+            reference_peak_db_min=-24.0,
+            reference_rms_db_min=-38.0,
+            processed_peak_db_max=-34.0,
+            processed_rms_db_max=-46.0,
+            copy_padding_seconds=0.0,
+            max_repair_duration_seconds=0.16,
+            context_window_seconds=0.18,
+            context_gap_seconds=0.0,
+            context_peak_db_min=-20.0,
+            context_rms_db_min=-32.0,
+        )
+
+        self.assertEqual(windows, [NoiseWindow(start_seconds=0.2, end_seconds=0.26)])
+        self.assertEqual(repaired[20:26], reference[20:26])
+
+    def test_repair_deepfilternet_speech_dropouts_skips_isolated_leading_artifact(self) -> None:
+        from array import array
+
+        sample_rate = 100
+        reference = array("h", [0] * 90)
+        for index in range(20, 26):
+            reference[index] = 4200
+        for index in range(50, 80):
+            reference[index] = 5200
+        processed = array("h", reference)
+        for index in range(20, 26):
+            processed[index] = 120
+
+        repaired, windows = repair_deepfilternet_speech_dropouts(
+            reference,
+            processed,
+            sample_rate=sample_rate,
+            window_seconds=0.06,
+            hop_seconds=0.01,
+            reference_peak_db_min=-24.0,
+            reference_rms_db_min=-38.0,
+            processed_peak_db_max=-34.0,
+            processed_rms_db_max=-46.0,
+            copy_padding_seconds=0.0,
+            max_repair_duration_seconds=0.16,
+            context_window_seconds=0.18,
+            context_gap_seconds=0.0,
+            context_peak_db_min=-20.0,
+            context_rms_db_min=-32.0,
+        )
+
+        self.assertEqual(windows, [])
+        self.assertEqual(repaired, processed)
+
+    def test_repair_deepfilternet_speech_dropouts_skips_long_low_energy_regions(self) -> None:
+        from array import array
+
+        sample_rate = 100
+        reference = array("h", [0] * 120)
+        for index in range(10, 40):
+            reference[index] = 3200
+        processed = array("h", [0] * 120)
+
+        repaired, windows = repair_deepfilternet_speech_dropouts(
+            reference,
+            processed,
+            sample_rate=sample_rate,
+            window_seconds=0.06,
+            hop_seconds=0.01,
+            reference_peak_db_min=-24.0,
+            reference_rms_db_min=-38.0,
+            processed_peak_db_max=-34.0,
+            processed_rms_db_max=-46.0,
+            copy_padding_seconds=0.0,
+            max_repair_duration_seconds=0.16,
+        )
+
+        self.assertEqual(windows, [])
+        self.assertEqual(repaired, processed)
 
     def test_attenuation_db_to_gain_converts_db_to_linear_floor(self) -> None:
         self.assertAlmostEqual(attenuation_db_to_gain(18.0), 0.12589254117941673)

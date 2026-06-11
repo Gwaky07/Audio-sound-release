@@ -1,4 +1,4 @@
 interface:
   display_name: "Audio-sound"
-  short_description: "处理气口、吸气、呼吸音、口水音、停顿残留、细丝、噪声及响度电平"
-  default_prompt: "Use $audio-sound to clean this spoken-word recording with the repository's approved workflow and deliver Chinese-named WAV/MP3 outputs."
+  short_description: "处理气口、吸气、呼吸音、口水音、停顿残留、细丝、噪声、响度电平，并保留中文名生成唯一版本"
+  default_prompt: "使用 $audio-sound 按仓库认可流程清理这段中文口播音频，交付保留中文原名并带运行编号的 WAV/MP3，同时给出频谱图和响度复核。"
