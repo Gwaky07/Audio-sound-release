@@ -7,7 +7,7 @@ name = "audio-sound"
 version = "0.2.0"
 description = "Standalone Codex-triggered audio processing pipeline."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.12"
 dependencies = []
 
 [project.scripts]

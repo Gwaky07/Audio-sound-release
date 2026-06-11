@@ -48,7 +48,7 @@ Legacy FFmpeg breath ducking and breath-onset cleanup are still available as com
 
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.10 or 3.11
 - `ffmpeg`
 - `ffprobe`
 
@@ -64,6 +64,8 @@ Optional external assets for the breath-first path:
 
 - local `Respiro-en` repository checkout
 - local `respiro-en.pt` model weights
+
+This repository is distributed as source code, not as a bundled runtime package. Local virtual environments, `.env` files, Respiro-en checkouts, model weights, generated audio, and Codex runtime state are intentionally excluded and must be prepared per machine.
 
 ## Quick start
 
@@ -260,12 +262,16 @@ For the cleanest shareable repository:
 
 For the receiving machine:
 
-1. Install Python 3.10+, `ffmpeg`, and `ffprobe`
+1. Install Python 3.10 or 3.11, `ffmpeg`, and `ffprobe`
 2. Run `setup.cmd`
-3. Run `doctor.cmd`
-4. Keep source media outside the repository when possible, or use `scratch/` for temporary local work
+3. Run `python scripts/audio_cleanup.py setup-respiro`
+4. Run `doctor.cmd`
+5. Confirm `doctor` reports `deepfilternet`, `respiro_en`, and `spectramini` as available before expecting full-quality output
+6. Keep source media outside the repository when possible, or use `scratch/` for temporary local work
 
 The repository is meant to stay source-only. Generated audio, reports, and temporary review files should remain under ignored working directories such as `output/` or `scratch/`.
+
+If a fully offline or double-click-ready delivery is required later, prepare that as a separate release package outside the repository and keep local assets out of git.
 
 ## Codex usage
 
