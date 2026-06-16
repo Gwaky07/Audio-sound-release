@@ -136,3 +136,65 @@ for label, path in files.items():
         print(name, start, end, peak, rms)
 '@ | python -
 ```
+
+## 11. 物理删词并同步剪视频
+
+当目标不是压低呼吸/口水音，而是把一句话或几个口头语从时间线上真正删掉时，用这个脚本。它会按给定时间窗删除片段，给音频接缝做短交叉淡化，并输出最终 WAV、MP3；如果输入是视频，还会同步剪视频并输出 MP4。
+
+单个文件：
+
+```bash
+python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
+```
+
+尾段删除时，结束时间留空：
+
+```bash
+python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "4.40," --removed-phrase "是不是"
+```
+
+同一个文件删多个位置时，重复 `--cut`：
+
+```bash
+python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "0.00,1.80" --cut "2.10,2.34" --cut "4.40," --removed-phrase "你看，那个，是，是不是"
+```
+
+批量处理用 JSON：
+
+```bash
+python ../../../scripts/remove_spoken_segments.py run-batch jobs.json
+```
+
+`jobs.json` 示例：
+
+```json
+{
+  "crossfade_ms": 35,
+  "jobs": [
+    {
+      "input": "C:/Users/Guanghe/Downloads/第二段.mp4",
+      "removed_phrase": "啊说德语啊",
+      "cuts": [{"start": 0.62, "end": 1.82}]
+    },
+    {
+      "input": "C:/Users/Guanghe/Downloads/第六段.mp4",
+      "removed_phrase": "你看，那个，是，是不是",
+      "cuts": [
+        {"start": 0.0, "end": 1.8},
+        {"start": 2.1, "end": 2.34},
+        {"start": 4.4}
+      ]
+    }
+  ]
+}
+```
+
+输出仍然只看：
+
+```text
+../../../output/修音成品/修音版_<原文件名>.wav
+../../../output/修音成品/修音版_<原文件名>.mp3
+../../../output/修音成品/修音版_<原文件名>.mp4
+```
+
+这个脚本不调用 Respiro-en 或 DeepFilterNet；报告里会明确记录它们未使用。它适合“明确给了时间点、要真正删掉文字”的场景，不替代默认的整体修音 workflow。

@@ -115,6 +115,20 @@ Run the final-delivery stable repository workflow:
 python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav"
 ```
 
+Remove known spoken segments from audio/video and smooth the joins:
+
+```bash
+python scripts/remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
+```
+
+For several cuts in one file, repeat `--cut`; use a blank end time for tail deletion:
+
+```bash
+python scripts/remove_spoken_segments.py run "D:/video/第六段.mp4" --cut "0.00,1.80" --cut "2.10,2.34" --cut "4.40," --removed-phrase "你看，那个，是，是不是"
+```
+
+The segment-removal script writes final WAV/MP3 files and, for video inputs, a sync-cut MP4 under `output/修音成品/`.
+
 Final WAV/MP3 files are copied to `output/修音成品/` by default. The user-facing name is:
 
 ```text
