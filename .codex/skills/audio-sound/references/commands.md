@@ -139,13 +139,21 @@ for label, path in files.items():
 
 ## 11. 物理删词并同步剪视频
 
-当目标不是压低呼吸/口水音，而是把一句话或几个口头语从时间线上真正删掉时，用这个脚本。它会按给定时间窗删除片段，给音频接缝做短交叉淡化，并输出最终 WAV、MP3；如果输入是视频，还会同步剪视频并输出 MP4。
+当目标不是压低呼吸/口水音，而是把一句话或几个口头语从时间线上真正删掉时，用这个脚本。它会按给定时间窗删除片段，在局部低能量边界收口，并输出最终 WAV、MP3；如果输入是视频，还会同步剪视频并输出 MP4。
 
 单个文件：
 
 ```bash
 python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
 ```
+
+如果删完仍有“边界残留”“接缝杂音”，先复核局部频谱和报告中的实际 `cuts`，不要直接拉长淡化。若两个保留句子续接过急，使用语音安全接缝：
+
+```bash
+python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "0.62,1.82" --removed-phrase "啊说德语啊" --seam-pause-ms 80
+```
+
+`--seam-pause-ms 60–100` 会让前句淡出、冻结视频上一帧、短暂停顿后再淡入下一句；它适合“卡一下”“突然接上一个字”，不应对所有删词默认启用。
 
 尾段删除时，结束时间留空：
 
@@ -169,7 +177,8 @@ python ../../../scripts/remove_spoken_segments.py run-batch jobs.json
 
 ```json
 {
-  "crossfade_ms": 35,
+  "crossfade_ms": 12,
+  "boundary_search_ms": 80,
   "jobs": [
     {
       "input": "C:/Users/Guanghe/Downloads/第二段.mp4",

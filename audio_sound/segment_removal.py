@@ -20,13 +20,19 @@ from .skill_workflow import _safe_windows_stem
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "修音成品"
 DEFAULT_SAMPLE_RATE = 44100
 DEFAULT_CHANNELS = 2
-DEFAULT_CROSSFADE_MS = 35.0
+DEFAULT_CROSSFADE_MS = 12.0
+DEFAULT_BOUNDARY_SEARCH_MS = 80.0
+BOUNDARY_ENERGY_WINDOW_MS = 8.0
+BOUNDARY_QUIET_RATIO = 0.35
+BOUNDARY_ABSOLUTE_RMS = 512.0
 
 
 @dataclass(frozen=True)
 class CutWindow:
     start_seconds: float
     end_seconds: float | None = None
+    seam_pause_ms: float | None = None
+    boundary_search_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,7 @@ class MediaProbe:
 class SpliceResult:
     samples: array
     crossfade_frames: list[int]
+    seam_pause_frames: list[int]
 
 
 def parse_time_seconds(value: str | int | float) -> float:
@@ -109,30 +116,57 @@ def parse_cut_payload(payload: Any) -> CutWindow:
     return CutWindow(
         start_seconds=parse_time_seconds(payload["start"]),
         end_seconds=parse_time_seconds(end_value) if end_value is not None else None,
+        seam_pause_ms=float(payload["seam_pause_ms"]) if payload.get("seam_pause_ms") is not None else None,
+        boundary_search_ms=(
+            float(payload["boundary_search_ms"]) if payload.get("boundary_search_ms") is not None else None
+        ),
     )
 
 
 def normalize_cuts(duration_seconds: float, cuts: Sequence[CutWindow]) -> list[CutWindow]:
     if duration_seconds <= 0:
         raise ValueError("Media duration must be greater than zero")
-    normalized: list[tuple[float, float]] = []
+    normalized: list[tuple[float, float, float | None, float | None]] = []
     for cut in cuts:
         start_seconds = min(max(cut.start_seconds, 0.0), duration_seconds)
         end_seconds = duration_seconds if cut.end_seconds is None else min(cut.end_seconds, duration_seconds)
         if end_seconds <= start_seconds:
             continue
-        normalized.append((start_seconds, end_seconds))
+        normalized.append((start_seconds, end_seconds, cut.seam_pause_ms, cut.boundary_search_ms))
 
-    normalized.sort()
-    merged: list[tuple[float, float]] = []
-    for start_seconds, end_seconds in normalized:
+    normalized.sort(key=lambda item: (item[0], item[1]))
+    merged: list[tuple[float, float, float | None, float | None]] = []
+    for start_seconds, end_seconds, seam_pause_ms, boundary_search_ms in normalized:
         if not merged or start_seconds > merged[-1][1]:
-            merged.append((start_seconds, end_seconds))
+            merged.append((start_seconds, end_seconds, seam_pause_ms, boundary_search_ms))
             continue
-        previous_start, previous_end = merged[-1]
-        merged[-1] = (previous_start, max(previous_end, end_seconds))
+        previous_start, previous_end, previous_pause_ms, previous_search_ms = merged[-1]
+        merged[-1] = (
+            previous_start,
+            max(previous_end, end_seconds),
+            max(value for value in (previous_pause_ms, seam_pause_ms) if value is not None)
+            if previous_pause_ms is not None or seam_pause_ms is not None
+            else None,
+            min(value for value in (previous_search_ms, boundary_search_ms) if value is not None)
+            if previous_search_ms is not None or boundary_search_ms is not None
+            else None,
+        )
 
-    return [CutWindow(start, end) for start, end in merged]
+    return [CutWindow(start, end, pause_ms, search_ms) for start, end, pause_ms, search_ms in merged]
+
+
+def build_join_seam_pause_ms(
+    duration_seconds: float,
+    cuts: Sequence[CutWindow],
+    *,
+    default_seam_pause_ms: float = 0.0,
+) -> list[float]:
+    normalized = normalize_cuts(duration_seconds, cuts)
+    return [
+        default_seam_pause_ms if cut.seam_pause_ms is None else cut.seam_pause_ms
+        for cut in normalized
+        if cut.start_seconds > 0.0 and (cut.end_seconds or duration_seconds) < duration_seconds
+    ]
 
 
 def build_keep_intervals(duration_seconds: float, cuts: Sequence[CutWindow]) -> list[KeepInterval]:
@@ -295,6 +329,124 @@ def _clip_pcm16(value: float) -> int:
     return max(-32768, min(32767, int(round(value))))
 
 
+def _frame_energy_prefix(
+    samples: array,
+    channels: int,
+    *,
+    start_frame: int,
+    end_frame: int,
+) -> list[float]:
+    frame_count = max(0, end_frame - start_frame)
+    prefix = [0.0] * (frame_count + 1)
+    running = 0.0
+    for local_frame in range(frame_count):
+        sample_offset = (start_frame + local_frame) * channels
+        frame_energy = 0.0
+        for channel_index in range(channels):
+            value = float(samples[sample_offset + channel_index])
+            frame_energy += value * value
+        running += frame_energy / channels
+        prefix[local_frame + 1] = running
+    return prefix
+
+
+def _window_rms(prefix: Sequence[float], center_frame: int, radius_frames: int) -> float:
+    frame_count = len(prefix) - 1
+    start_frame = max(0, center_frame - radius_frames)
+    end_frame = min(frame_count, center_frame + radius_frames + 1)
+    if end_frame <= start_frame:
+        return 0.0
+    mean_square = (prefix[end_frame] - prefix[start_frame]) / (end_frame - start_frame)
+    return math.sqrt(max(0.0, mean_square))
+
+
+def _find_quiet_boundary_frame(
+    samples: array,
+    *,
+    channels: int,
+    frame_count: int,
+    requested_frame: int,
+    search_start_frame: int,
+    search_end_frame: int,
+    radius_frames: int,
+) -> int:
+    prefix_start = max(0, search_start_frame - radius_frames)
+    prefix_end = min(frame_count, search_end_frame + radius_frames + 1)
+    prefix = _frame_energy_prefix(
+        samples,
+        channels,
+        start_frame=prefix_start,
+        end_frame=prefix_end,
+    )
+    local_requested = requested_frame - prefix_start
+    requested_rms = _window_rms(prefix, local_requested, radius_frames)
+    quiet_limit = max(BOUNDARY_ABSOLUTE_RMS, requested_rms * BOUNDARY_QUIET_RATIO)
+    candidates: list[tuple[int, float, int]] = []
+    for frame_index in range(search_start_frame, search_end_frame + 1):
+        rms = _window_rms(prefix, frame_index - prefix_start, radius_frames)
+        if rms <= quiet_limit:
+            candidates.append((abs(frame_index - requested_frame), rms, frame_index))
+    if not candidates:
+        return requested_frame
+    return min(candidates)[2]
+
+
+def refine_cut_windows_pcm16(
+    samples: array,
+    *,
+    channels: int,
+    sample_rate: int,
+    cuts: Sequence[CutWindow],
+    search_ms: float = DEFAULT_BOUNDARY_SEARCH_MS,
+) -> list[CutWindow]:
+    if channels <= 0:
+        raise ValueError("Channel count must be positive")
+    if sample_rate <= 0:
+        raise ValueError("Sample rate must be positive")
+    frame_count = len(samples) // channels
+    radius_frames = max(1, int(round(sample_rate * BOUNDARY_ENERGY_WINDOW_MS / 2000.0)))
+    refined: list[CutWindow] = []
+    for cut in cuts:
+        cut_search_ms = search_ms if cut.boundary_search_ms is None else cut.boundary_search_ms
+        if cut_search_ms <= 0:
+            refined.append(cut)
+            continue
+        search_frames = max(1, int(round(sample_rate * cut_search_ms / 1000.0)))
+        requested_start = min(frame_count, max(0, int(round(cut.start_seconds * sample_rate))))
+        refined_start = _find_quiet_boundary_frame(
+            samples,
+            channels=channels,
+            frame_count=frame_count,
+            requested_frame=requested_start,
+            search_start_frame=max(0, requested_start - search_frames),
+            search_end_frame=requested_start,
+            radius_frames=radius_frames,
+        )
+        if cut.end_seconds is None:
+            refined_end_seconds = None
+        else:
+            requested_end = min(frame_count, max(refined_start, int(round(cut.end_seconds * sample_rate))))
+            refined_end = _find_quiet_boundary_frame(
+                samples,
+                channels=channels,
+                frame_count=frame_count,
+                requested_frame=requested_end,
+                search_start_frame=requested_end,
+                search_end_frame=min(frame_count, requested_end + search_frames),
+                radius_frames=radius_frames,
+            )
+            refined_end_seconds = refined_end / sample_rate
+        refined.append(
+            CutWindow(
+                start_seconds=refined_start / sample_rate,
+                end_seconds=refined_end_seconds,
+                seam_pause_ms=cut.seam_pause_ms,
+                boundary_search_ms=cut.boundary_search_ms,
+            )
+        )
+    return refined
+
+
 def splice_pcm16_samples(
     samples: array,
     *,
@@ -302,12 +454,15 @@ def splice_pcm16_samples(
     sample_rate: int,
     keep_intervals: Sequence[KeepInterval],
     crossfade_ms: float = DEFAULT_CROSSFADE_MS,
+    seam_pause_ms: float = 0.0,
+    seam_pause_ms_by_join: Sequence[float] | None = None,
 ) -> SpliceResult:
     if channels <= 0:
         raise ValueError("Channel count must be positive")
     fade_frames_requested = max(0, int(round(sample_rate * crossfade_ms / 1000.0)))
     output = array("h")
     crossfade_frames: list[int] = []
+    seam_pause_frames: list[int] = []
 
     for interval_index, interval in enumerate(keep_intervals):
         start_frame = max(0, int(round(interval.start_seconds * sample_rate)))
@@ -322,10 +477,47 @@ def splice_pcm16_samples(
         output_frames = len(output) // channels
         segment_frames = len(segment) // channels
         fade_frames = min(fade_frames_requested, output_frames, segment_frames)
-        crossfade_frames.append(fade_frames)
+        join_index = len(crossfade_frames)
+        join_pause_ms = (
+            seam_pause_ms_by_join[join_index]
+            if seam_pause_ms_by_join is not None and join_index < len(seam_pause_ms_by_join)
+            else seam_pause_ms
+        )
+        pause_frames_requested = max(0, int(round(sample_rate * join_pause_ms / 1000.0)))
         if fade_frames <= 0:
+            crossfade_frames.append(0)
+            seam_pause_frames.append(pause_frames_requested)
+            output.extend(array("h", [0]) * (pause_frames_requested * channels))
             output.extend(segment)
             continue
+
+        if pause_frames_requested:
+            prefix_sample_count = len(output) - fade_frames * channels
+            prefix = output[:prefix_sample_count]
+            outgoing = output[prefix_sample_count:]
+            incoming = segment[: fade_frames * channels]
+            faded_outgoing = array("h")
+            faded_incoming = array("h")
+            for frame_index in range(fade_frames):
+                out_progress = (frame_index + 1) / fade_frames
+                in_progress = frame_index / (fade_frames - 1) if fade_frames > 1 else 0.0
+                out_gain = math.cos(out_progress * math.pi / 2.0)
+                in_gain = math.sin(in_progress * math.pi / 2.0)
+                for channel_index in range(channels):
+                    sample_index = frame_index * channels + channel_index
+                    faded_outgoing.append(_clip_pcm16(outgoing[sample_index] * out_gain))
+                    faded_incoming.append(_clip_pcm16(incoming[sample_index] * in_gain))
+            output = prefix
+            output.extend(faded_outgoing)
+            output.extend(array("h", [0]) * (pause_frames_requested * channels))
+            output.extend(faded_incoming)
+            output.extend(segment[fade_frames * channels :])
+            crossfade_frames.append(0)
+            seam_pause_frames.append(pause_frames_requested)
+            continue
+
+        crossfade_frames.append(fade_frames)
+        seam_pause_frames.append(0)
 
         prefix_sample_count = len(output) - fade_frames * channels
         prefix = output[:prefix_sample_count]
@@ -350,7 +542,11 @@ def splice_pcm16_samples(
 
     if not output:
         raise ValueError("Splice result is empty")
-    return SpliceResult(samples=output, crossfade_frames=crossfade_frames)
+    return SpliceResult(
+        samples=output,
+        crossfade_frames=crossfade_frames,
+        seam_pause_frames=seam_pause_frames,
+    )
 
 
 def splice_wav_file(
@@ -359,6 +555,8 @@ def splice_wav_file(
     *,
     keep_intervals: Sequence[KeepInterval],
     crossfade_ms: float = DEFAULT_CROSSFADE_MS,
+    seam_pause_ms: float = 0.0,
+    seam_pause_ms_by_join: Sequence[float] | None = None,
 ) -> SpliceResult:
     params, samples = _read_pcm16_wav(source_wav)
     result = splice_pcm16_samples(
@@ -367,6 +565,8 @@ def splice_wav_file(
         sample_rate=params.framerate,
         keep_intervals=keep_intervals,
         crossfade_ms=crossfade_ms,
+        seam_pause_ms=seam_pause_ms,
+        seam_pause_ms_by_join=seam_pause_ms_by_join,
     )
     updated_params = params._replace(nframes=len(result.samples) // params.nchannels)
     _write_pcm16_wav(output_wav, updated_params, result.samples)
@@ -400,25 +600,43 @@ def _format_seconds(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
 
 
-def build_video_trim_filter(keep_intervals: Sequence[KeepInterval]) -> str:
+def build_video_trim_filter(
+    keep_intervals: Sequence[KeepInterval],
+    *,
+    crossfade_frames: Sequence[int] = (),
+    seam_pause_frames: Sequence[int] = (),
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> str:
     if not keep_intervals:
         raise ValueError("At least one keep interval is required")
-    if len(keep_intervals) == 1:
-        interval = keep_intervals[0]
+    if sample_rate <= 0:
+        raise ValueError("Sample rate must be positive")
+    adjusted_intervals: list[KeepInterval] = []
+    for index, interval in enumerate(keep_intervals):
+        end_seconds = interval.end_seconds
+        if index < len(crossfade_frames):
+            end_seconds = max(interval.start_seconds, end_seconds - crossfade_frames[index] / sample_rate)
+        adjusted_intervals.append(KeepInterval(interval.start_seconds, end_seconds))
+    if len(adjusted_intervals) == 1:
+        interval = adjusted_intervals[0]
         return (
             f"[0:v]trim=start={_format_seconds(interval.start_seconds)}:"
             f"end={_format_seconds(interval.end_seconds)},setpts=PTS-STARTPTS[vout]"
         )
     parts: list[str] = []
     concat_inputs: list[str] = []
-    for index, interval in enumerate(keep_intervals):
+    for index, interval in enumerate(adjusted_intervals):
         label = f"v{index}"
-        parts.append(
+        filter_chain = (
             f"[0:v]trim=start={_format_seconds(interval.start_seconds)}:"
-            f"end={_format_seconds(interval.end_seconds)},setpts=PTS-STARTPTS[{label}]"
+            f"end={_format_seconds(interval.end_seconds)},setpts=PTS-STARTPTS"
         )
+        if index < len(seam_pause_frames) and seam_pause_frames[index] > 0:
+            pause_seconds = seam_pause_frames[index] / sample_rate
+            filter_chain += f",tpad=stop_mode=clone:stop_duration={_format_seconds(pause_seconds)}"
+        parts.append(f"{filter_chain}[{label}]")
         concat_inputs.append(f"[{label}]")
-    parts.append(f"{''.join(concat_inputs)}concat=n={len(keep_intervals)}:v=1:a=0[vout]")
+    parts.append(f"{''.join(concat_inputs)}concat=n={len(adjusted_intervals)}:v=1:a=0[vout]")
     return ";".join(parts)
 
 
@@ -428,6 +646,9 @@ def export_synced_mp4(
     output_mp4: Path,
     *,
     keep_intervals: Sequence[KeepInterval],
+    crossfade_frames: Sequence[int],
+    seam_pause_frames: Sequence[int],
+    sample_rate: int,
     ffmpeg_bin: str,
 ) -> None:
     _run_command(
@@ -441,7 +662,12 @@ def export_synced_mp4(
             "-i",
             str(edited_wav),
             "-filter_complex",
-            build_video_trim_filter(keep_intervals),
+            build_video_trim_filter(
+                keep_intervals,
+                crossfade_frames=crossfade_frames,
+                seam_pause_frames=seam_pause_frames,
+                sample_rate=sample_rate,
+            ),
             "-map",
             "[vout]",
             "-map",
@@ -471,6 +697,8 @@ def _cuts_to_report(cuts: Sequence[CutWindow]) -> list[dict[str, float | None]]:
         {
             "start_seconds": cut.start_seconds,
             "end_seconds": cut.end_seconds,
+            "seam_pause_ms": cut.seam_pause_ms,
+            "boundary_search_ms": cut.boundary_search_ms,
         }
         for cut in cuts
     ]
@@ -495,6 +723,8 @@ def process_segment_removal_job(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     output_stem: str | None = None,
     crossfade_ms: float = DEFAULT_CROSSFADE_MS,
+    boundary_search_ms: float = DEFAULT_BOUNDARY_SEARCH_MS,
+    seam_pause_ms: float = 0.0,
     keep_work: bool = False,
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
@@ -509,10 +739,9 @@ def process_segment_removal_job(
     if not probe.has_audio:
         raise ValueError(f"Input media has no audio stream: {input_path}")
 
-    normalized_cuts = normalize_cuts(probe.duration_seconds, cuts)
-    if not normalized_cuts:
+    requested_cuts = normalize_cuts(probe.duration_seconds, cuts)
+    if not requested_cuts:
         raise ValueError("No cut window intersects the input media duration")
-    keep_intervals = build_keep_intervals(probe.duration_seconds, normalized_cuts)
     output_dir = output_dir.expanduser().resolve()
     delivery_paths = reserve_delivery_paths(output_dir, input_path.stem, output_stem=output_stem)
     temp_parent = PROJECT_ROOT / "output"
@@ -522,11 +751,30 @@ def process_segment_removal_job(
 
     try:
         extract_audio_wav(input_path, source_wav, ffmpeg_bin=ffmpeg_bin)
+        source_params, source_samples = _read_pcm16_wav(source_wav)
+        refined_cuts = normalize_cuts(
+            probe.duration_seconds,
+            refine_cut_windows_pcm16(
+                source_samples,
+                channels=source_params.nchannels,
+                sample_rate=source_params.framerate,
+                cuts=requested_cuts,
+                search_ms=boundary_search_ms,
+            ),
+        )
+        keep_intervals = build_keep_intervals(probe.duration_seconds, refined_cuts)
+        seam_pause_ms_by_join = build_join_seam_pause_ms(
+            probe.duration_seconds,
+            refined_cuts,
+            default_seam_pause_ms=seam_pause_ms,
+        )
         splice_result = splice_wav_file(
             source_wav,
             delivery_paths.wav,
             keep_intervals=keep_intervals,
             crossfade_ms=crossfade_ms,
+            seam_pause_ms=seam_pause_ms,
+            seam_pause_ms_by_join=seam_pause_ms_by_join,
         )
         export_mp3(delivery_paths.wav, delivery_paths.mp3, ffmpeg_bin=ffmpeg_bin)
         mp4_path: Path | None = None
@@ -536,6 +784,9 @@ def process_segment_removal_job(
                 delivery_paths.wav,
                 delivery_paths.mp4,
                 keep_intervals=keep_intervals,
+                crossfade_frames=splice_result.crossfade_frames,
+                seam_pause_frames=splice_result.seam_pause_frames,
+                sample_rate=source_params.framerate,
                 ffmpeg_bin=ffmpeg_bin,
             )
             mp4_path = delivery_paths.mp4
@@ -549,13 +800,18 @@ def process_segment_removal_job(
                 "has_audio": probe.has_audio,
                 "has_video": probe.has_video,
             },
-            "cuts": _cuts_to_report(normalized_cuts),
+            "requested_cuts": _cuts_to_report(requested_cuts),
+            "cuts": _cuts_to_report(refined_cuts),
             "keep_intervals": _intervals_to_report(keep_intervals),
             "removed_duration_seconds": sum(
-                (cut.end_seconds or probe.duration_seconds) - cut.start_seconds for cut in normalized_cuts
+                (cut.end_seconds or probe.duration_seconds) - cut.start_seconds for cut in refined_cuts
             ),
             "crossfade_ms": crossfade_ms,
             "crossfade_frames": splice_result.crossfade_frames,
+            "seam_pause_ms": seam_pause_ms,
+            "seam_pause_ms_by_join": seam_pause_ms_by_join,
+            "seam_pause_frames": splice_result.seam_pause_frames,
+            "boundary_search_ms": boundary_search_ms,
             "estimated_edited_audio_duration_seconds": edited_audio_duration,
             "deliverables": {
                 "wav": str(delivery_paths.wav),
@@ -592,6 +848,8 @@ def _load_jobs(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             if key
             in {
                 "crossfade_ms",
+                "boundary_search_ms",
+                "seam_pause_ms",
                 "output_dir",
                 "keep_work",
             }
@@ -607,6 +865,8 @@ def _build_single_job_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "removed_phrase": args.removed_phrase,
         "output_stem": args.output_stem,
         "crossfade_ms": args.crossfade_ms,
+        "boundary_search_ms": args.boundary_search_ms,
+        "seam_pause_ms": args.seam_pause_ms,
         "output_dir": args.output_dir,
         "keep_work": args.keep_work,
     }
@@ -625,6 +885,8 @@ def _coerce_job(job: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]
         "removed_phrase": merged.get("removed_phrase"),
         "output_stem": merged.get("output_stem"),
         "crossfade_ms": float(merged.get("crossfade_ms", DEFAULT_CROSSFADE_MS)),
+        "boundary_search_ms": float(merged.get("boundary_search_ms", DEFAULT_BOUNDARY_SEARCH_MS)),
+        "seam_pause_ms": float(merged.get("seam_pause_ms", 0.0)),
         "output_dir": merged.get("output_dir"),
         "keep_work": bool(merged.get("keep_work", False)),
     }
@@ -651,6 +913,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--removed-phrase", default=None, help="Phrase being removed, for the report.")
     run_parser.add_argument("--crossfade-ms", type=float, default=DEFAULT_CROSSFADE_MS)
+    run_parser.add_argument("--boundary-search-ms", type=float, default=DEFAULT_BOUNDARY_SEARCH_MS)
+    run_parser.add_argument("--seam-pause-ms", type=float, default=0.0)
     run_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     run_parser.add_argument("--output-stem", default=None)
     run_parser.add_argument("--keep-work", action="store_true")
@@ -658,6 +922,8 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser = subparsers.add_parser("run-batch", help="Process jobs from a JSON file.")
     batch_parser.add_argument("jobs_json", help="Batch job JSON path.")
     batch_parser.add_argument("--crossfade-ms", type=float, default=None)
+    batch_parser.add_argument("--boundary-search-ms", type=float, default=None)
+    batch_parser.add_argument("--seam-pause-ms", type=float, default=None)
     batch_parser.add_argument("--output-dir", default=None)
     batch_parser.add_argument("--keep-work", action="store_true")
 
@@ -682,6 +948,8 @@ def run_jobs(
                 output_dir=Path(resolved["output_dir"] or DEFAULT_OUTPUT_DIR),
                 output_stem=resolved["output_stem"],
                 crossfade_ms=resolved["crossfade_ms"],
+                boundary_search_ms=resolved["boundary_search_ms"],
+                seam_pause_ms=resolved["seam_pause_ms"],
                 keep_work=resolved["keep_work"],
                 ffmpeg_bin=ffmpeg_bin,
                 ffprobe_bin=ffprobe_bin,
@@ -704,6 +972,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         jobs, defaults = _load_jobs(Path(args.jobs_json))
         if args.crossfade_ms is not None:
             defaults["crossfade_ms"] = args.crossfade_ms
+        if args.boundary_search_ms is not None:
+            defaults["boundary_search_ms"] = args.boundary_search_ms
+        if args.seam_pause_ms is not None:
+            defaults["seam_pause_ms"] = args.seam_pause_ms
         if args.output_dir is not None:
             defaults["output_dir"] = args.output_dir
         if args.keep_work:

@@ -129,6 +129,12 @@ python scripts/remove_spoken_segments.py run "D:/video/第六段.mp4" --cut "0.0
 
 The segment-removal script writes final WAV/MP3 files and, for video inputs, a sync-cut MP4 under `output/修音成品/`.
 
+By default, each requested cut boundary is allowed to expand outward by up to 80 ms when a clearly quieter waveform valley is found. This helps remove clipped syllable tails and leading consonant residue without moving a boundary deeper into retained speech. Joins use a short 12 ms equal-power crossfade, and video trims compensate for the exact audio overlap so repeated cuts do not accumulate A/V drift.
+
+Use `--boundary-search-ms 0` to keep the exact requested boundaries, or lower the search window for tightly packed speech. `--crossfade-ms` remains available for exceptional joins; longer crossfades overlap more speech and should not be used as the primary fix for residual phonemes.
+
+When two retained phrases still sound unnaturally attached after deletion, use `--seam-pause-ms 60` to `100`. This switches the join from overlapping different phonemes to a short fade-out, held-frame pause, and fade-in. Leave it at the default `0` unless a reviewed speech join specifically needs extra breathing room.
+
 Final WAV/MP3 files are copied to `output/修音成品/` by default. The user-facing name is:
 
 ```text
