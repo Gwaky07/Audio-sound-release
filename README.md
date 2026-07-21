@@ -1,329 +1,220 @@
 # Audio-sound
 
-`Audio-sound` is a standalone repository for spoken-word audio processing. It is designed to be triggered from Codex with natural language, but the runtime capability lives in this repository itself: setup, doctor, inspect, clean/process, preset routing, reporting, and output layout are all owned locally.
+`Audio-sound` 是一个面向中文口播、课程讲解、旁白和访谈音频的 Windows 本地音频清理工作流仓库。
 
-The Feishu document and the `audio-preprocess` repository were treated as references while shaping the design. They are not runtime dependencies.
+它的目标不是做一个轻量预览，而是让 Codex 或人工操作者能直接得到可交付的修音成品：降噪、去呼吸/口水音、处理停顿残留、修复删词接缝，并输出可复核的报告与频谱证据。
 
-## Scope
+## 适用范围
 
-This repository currently focuses on stable automation for:
+当前仓库主要适合：
 
-- voiceovers
-- narration
-- lecture and course audio
-- interview stems with moderate noise
-- batch cleanup with report output
+- 中文课程讲解
+- 中文口播 / 配音 / 旁白
+- 中等噪声环境下的采访音轨
+- 需要批量处理并保留报告的音频
+- 需要删除口误、重复字、废句并修复接缝的视频/音频
 
-The processing path is:
+## 仓库结构
 
-1. extract source audio to WAV
-2. detect breath regions via Respiro-en
-3. apply SpectraMini-style breath control and mouth de-click cleanup
-4. run primary denoise via DeepFilterNet
-5. apply FFmpeg mastering filters
-6. export clean WAV
-7. export transcript-ready MP3
-8. write JSON and Markdown reports
+- `.codex/skills/audio-sound/`：仓库级 Codex skill，记录默认处理规则和验收标准。
+- `audio_sound/`：核心 Python 包，包含配置、流程、删词剪辑和 CLI 逻辑。
+- `scripts/audio_cleanup.py`：底层清理、检查、安装和维护入口。
+- `scripts/audio_skill_workflow.py`：推荐的最终成品处理入口。
+- `scripts/remove_spoken_segments.py`：物理删词、删句、视频同步剪辑入口。
+- `presets/`：处理预设。
+- `docs/`：架构、调参和参考说明。
+- `tests/`：单元测试。
+- `release/`：仅用于说明发布包位置；正式压缩包放在 GitHub Releases。
 
-Legacy FFmpeg breath ducking and breath-onset cleanup are still available as compatibility filters, but they are no longer part of the default path.
+## 环境要求
 
-## Repository layout
-
-- `.codex/skills/audio-sound/`
-  - single project skill for the approved repo-local audio workflow
-- `audio_sound/`
-  - config, bootstrap, pipeline, CLI
-- `audio_sound/skill_workflow.py`
-  - stable repository workflow with spectrogram and delivery artifacts
-- `presets/`
-  - standalone JSON presets
-- `scripts/audio_cleanup.py`
-  - local CLI entrypoint
-- `scripts/audio_skill_workflow.py`
-  - stable workflow entrypoint
-- `docs/`
-  - architecture, tuning, reference notes
-- `tests/`
-  - unit tests for command building and repository behavior
-
-## Prerequisites
+必需：
 
 - Python 3.10+
 - `ffmpeg`
 - `ffprobe`
 
-Optional but recommended for the full processing path:
+推荐：
 
-- `torch==2.2.2`
-- `torchaudio==2.2.2`
-- `librosa==0.10.0`
-- `intervaltree==3.1.0`
+- `torch`
+- `torchaudio`
+- `librosa`
+- `intervaltree`
 - `deepfilternet`
 
-Optional external assets for the breath-first path:
+可选外部资产：
 
-- local `Respiro-en` repository checkout
-- local `respiro-en.pt` model weights
+- 本地 `Respiro-en` 仓库
+- 本地 `respiro-en.pt` 权重
 
-## Quick start
+注意：`tools/`、`ffmpeg/`、`.env`、`output/`、`scratch/` 都是本地运行资产，不进入 Git 仓库。
 
-List presets:
+## 快速开始
 
-```bash
-python scripts/audio_cleanup.py list-presets
-```
-
-Check local runtime:
+检查运行环境：
 
 ```bash
 python scripts/audio_cleanup.py doctor
 ```
 
-Install recommended local runtime packages:
+Windows 下初始化本地环境：
 
-```bash
-python scripts/audio_cleanup.py setup
-```
-
-Install real Respiro-en assets locally and write `.env` automatically:
-
-```bash
-python scripts/audio_cleanup.py setup-respiro
-```
-
-Or on Windows, use the repo helper which creates `.venv` first:
-
-```bash
+```bat
 setup.cmd
 ```
 
-Inspect one file:
+列出可用预设：
+
+```bash
+python scripts/audio_cleanup.py list-presets
+```
+
+检查单个音频文件：
 
 ```bash
 python scripts/audio_cleanup.py inspect "D:/audio/raw-voice.wav"
 ```
 
-Process one file with the lower-level preset CLI:
+## 推荐成品流程
 
-```bash
-python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav"
-```
-
-Run the final-delivery stable repository workflow:
+默认最终交付请使用：
 
 ```bash
 python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav"
 ```
 
-Remove known spoken segments from audio/video and smooth the joins:
+该流程会：
 
-```bash
-python scripts/remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
-```
+1. 提取源音频为 WAV。
+2. 检查运行环境和可用依赖。
+3. 执行呼吸、口水音、噪声和响度处理。
+4. 输出最终 WAV 和 MP3。
+5. 生成报告、指标和频谱证据。
+6. 将最终成品放入 `output/修音成品/`。
 
-For several cuts in one file, repeat `--cut`; use a blank end time for tail deletion:
-
-```bash
-python scripts/remove_spoken_segments.py run "D:/video/第六段.mp4" --cut "0.00,1.80" --cut "2.10,2.34" --cut "4.40," --removed-phrase "你看，那个，是，是不是"
-```
-
-The segment-removal script writes final WAV/MP3 files and, for video inputs, a sync-cut MP4 under `output/修音成品/`.
-
-By default, each requested cut boundary is allowed to expand outward by up to 80 ms when a clearly quieter waveform valley is found. This helps remove clipped syllable tails and leading consonant residue without moving a boundary deeper into retained speech. Joins use a short 12 ms equal-power crossfade, and video trims compensate for the exact audio overlap so repeated cuts do not accumulate A/V drift.
-
-Use `--boundary-search-ms 0` to keep the exact requested boundaries, or lower the search window for tightly packed speech. `--crossfade-ms` remains available for exceptional joins; longer crossfades overlap more speech and should not be used as the primary fix for residual phonemes.
-
-When two retained phrases still sound unnaturally attached after deletion, use `--seam-pause-ms 60` to `100`. This switches the join from overlapping different phonemes to a short fade-out, held-frame pause, and fade-in. Leave it at the default `0` unless a reviewed speech join specifically needs extra breathing room.
-
-Final WAV/MP3 files are copied to `output/修音成品/` by default. The user-facing name is:
+最终命名规则：
 
 ```text
 修音版_<原音频文件名>.wav
 修音版_<原音频文件名>.mp3
 ```
 
-If that name already exists, the workflow writes the next version as `_01`, `_02`, and so on. Internal stage audio is removed by default after the report, metrics, and spectrogram artifacts are written. Use `--keep-intermediate-audio` only when troubleshooting a specific processing stage.
+如果同名文件已存在，则自动递增为 `_01`、`_02`。
 
-Installed entrypoint for the same final-delivery workflow:
+## 删词与接缝修复
 
-```bash
-audio-skill-workflow run "D:/audio/raw-voice.wav"
-```
-
-`process` is an alias:
+当目标是删除一句话、口误、重复字或指定时间段时，不要只做降噪，应使用物理删词脚本：
 
 ```bash
-python scripts/audio_cleanup.py process "D:/audio/raw-voice.wav"
+python scripts/remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
 ```
 
-Batch process a folder recursively:
+多个片段可以重复传入 `--cut`：
 
 ```bash
-python scripts/audio_cleanup.py clean "D:/audio/batch" --preset review --recursive
+python scripts/remove_spoken_segments.py run "D:/video/第六段.mp4" --cut "0.00,1.80" --cut "2.10,2.34" --removed-phrase "删除口误"
 ```
 
-Dry-run one file:
+默认删词规则：
+
+- `--boundary-search-ms 80`：在边界附近寻找更低能量位置，避免保留残留音素。
+- `--crossfade-ms 12`：短交叉淡化，只用于防爆点，不用于掩盖残留。
+- 视频输入会同步补偿音频交叉淡化，避免多次删除后音画漂移。
+
+如果删完后仍然像“突然接上下一句/一个字”，不要继续拉长交叉淡化，改用语音安全接缝：
 
 ```bash
-python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --dry-run
+python scripts/remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊" --seam-pause-ms 80
 ```
 
-Run with the repo-local `.venv` and real Respiro-en assets from `.env`:
+`--seam-pause-ms 60–100` 会让前句淡出、短暂停顿、下一句淡入，并在视频上冻结上一帧同等时长。
+
+## 常用预设
+
+- `fast`：快速一遍处理，动态处理较轻。
+- `safe`：默认中文口播安全预设。
+- `review`：清理后额外输出可疑静音/残留候选。
+- `voice-isolate`：使用同文件噪声窗口做更有针对性的非人声残留压制。
+
+示例：
 
 ```bash
-.venv/Scripts/python.exe scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --python-executable ".venv/Scripts/python.exe"
+python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --preset voice-isolate --noise-window 143.089208:144.093687
 ```
 
-If `AUDIO_SOUND_RESPIRO_REPO` or `AUDIO_SOUND_RESPIRO_WEIGHTS` is missing, the pipeline falls back to the local heuristic breath detector and still completes the full cleanup flow.
+## 输出目录
 
-## Presets
-
-- `fast`
-  - fast first pass, lighter dynamic processing
-- `safe`
-  - default spoken-word preset with breath-first ordering
-- `review`
-  - cleanup plus heuristic silence candidate reporting
-- `voice-isolate`
-  - AU-style cleanup using captured noise-only windows to suppress non-voice residue more selectively
-
-Runtime overrides:
-
-- `--target-lufs`
-- `--denoise-strength light|medium|aggressive`
-- `--disable-gate`
-- `--enable-silence-report`
-- `--attenuation-db`
-- `--respiro-threshold`
-- `--respiro-min-length-ms`
-- `--respiro-repo`
-- `--respiro-weights`
-- `--enable-legacy-breath-filters`
-  - opt back into the older `breath_ducking` and `breath_onset_cleanup` compatibility filters
-- `--skip-spectramini`
-- `--skip-deepfilternet`
-- `--noise-window start:end`
-  - repeat this flag to capture multiple clean noise-only spans from the same file
-  - example: `--noise-window 143.089208:144.093687 --noise-window 161.583729:169.578792`
-
-Example voice-isolate run:
-
-```bash
-python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --preset voice-isolate --noise-window 143.089208:144.093687 --noise-window 161.583729:169.578792
-```
-
-Example real Respiro-en run with explicit paths:
-
-```bash
-python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --respiro-repo "D:/audio-tools/Respiro-en" --respiro-weights "D:/audio-tools/respiro-en.pt"
-```
-
-Example compatibility run with the older legacy breath filters restored:
-
-```bash
-python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --preset voice-isolate --enable-legacy-breath-filters
-```
-
-Describe stable workflow modes:
-
-```bash
-python scripts/audio_skill_workflow.py describe-modes
-```
-
-Stable workflow with focused spectrogram windows:
-
-```bash
-python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --focus-window pause_a,12,12 --focus-window pause_b,29,3
-```
-
-## Output layout
-
-Default skill runs write two kinds of output:
+默认输出分两类：
 
 - `output/修音成品/`
-  - final user-facing WAV/MP3 only
-  - names are `修音版_<原音频文件名>.wav|mp3`
-  - repeated runs for the same source become `修音版_<原音频文件名>_01.wav|mp3`, then `_02`, etc.
+  - 面向用户的最终 WAV/MP3/MP4。
+  - 文件名遵守 `修音版_<原文件名>` 规则。
 - `output/skill-<timestamp>_<source>/`
-  - workflow reports, metrics, and spectrogram evidence
-  - internal stage audio is removed by default to avoid confusing the final result
+  - 流程报告、指标和频谱证据。
+  - 中间音频默认清理，避免误交付。
 
-Example final delivery folder:
-
-```text
-output/修音成品/
-  修音版_女生（测试2）.wav
-  修音版_女生（测试2）.mp3
-  修音版_女生（测试2）_01.wav
-  修音版_女生（测试2）_01.mp3
-```
-
-Troubleshooting output remains under the run root:
-
-```text
-output/skill-20260611-081223_女生-测试2/
-  batch-summary.json
-  batch-summary.md
-  skill-workflow-summary.json
-  skill-workflow-summary.md
-  20260611-081223_女生（测试2）/
-    audio_preprocess/
-      audio_process_report.json
-      audio_process_report.md
-      workflow_artifacts/
-        skill-file-report.json
-        skill-file-report.md
-        spectrograms/
-```
-
-When you need to inspect raw, DeepFilterNet, mastered, or bridge-clean audio stages, run:
+排查时如需保留中间音频：
 
 ```bash
 python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --keep-intermediate-audio
 ```
 
-## Codex usage
+## Codex 使用规则
 
-This repository contains a single project skill at `.codex/skills/audio-sound/SKILL.md`.
+本仓库包含项目 skill：
 
-Default rule:
+```text
+.codex/skills/audio-sound/SKILL.md
+```
 
-- In this repository, if you ask Codex to process or clean audio, it should treat that as a request for the final usable version by default.
-- The default target is the approved strict spoken-word finish: remove breaths, gasps, saliva noise, pause residue, and room noise as cleanly as possible, keep loudness and peak in the approved range, preserve Chinese filenames, and deliver directly usable WAV/MP3 outputs.
-- Unless you explicitly ask for another mode, Codex should prefer `reference-legacy` and continue with node inspection plus exact repair until the result is clean enough to deliver.
-- Final audio should be taken from `output/修音成品/`, not from `audio_preprocess/`.
-- The final naming rule is `修音版_<原音频文件名>.wav|mp3`; repeated runs append `_01`, `_02`, etc.
-- For final delivery, prefer `audio-skill-workflow run ...` or `python scripts/audio_skill_workflow.py run ...`; keep `audio_cleanup.py clean` for lower-level preset control, inspection, setup, and compatibility paths.
+在本仓库中，如果用户要求“处理音频”“修一下音频”“剪掉这句”“边界有残留”，Codex 应默认理解为最终可交付任务，而不是简单预览。
 
-Recommended Chinese prompts:
+关键规则：
 
-- “用 `audio-sound` 按最终成品标准处理这个音频，直接给我可用版本。”
-- “用 `audio-sound` 清理这个中文口播，去掉气口、吸气、呼吸音、口水音，顺便处理降噪、响度和音量，按最终版交付。”
-- “用 `audio-sound` 批量处理这个文件夹，默认都按最终可用成品做，不要先出轻处理版。”
-- “用 `audio-sound` 处理完后继续巡检频谱，把残留呼吸音和细丝节点补干净。”
-- “用 `audio-sound` 按仓库认可标准处理，并保留中文原文件名加后缀输出。”
+- 默认成品入口是 `python scripts/audio_skill_workflow.py run ...`。
+- 删词、删句、重复字和接缝问题必须使用 `scripts/remove_spoken_segments.py`。
+- 时间码只是候选，必须结合波形、频谱和局部听感确认边界。
+- ASR 只能辅助定位，不能单独判定“重复字已解决”。
+- 导出后必须二次完整复核，不只检查修改过的窗口。
+- 旧错误成品不要作为新剪辑源，只能作为缺陷参考。
 
-The skill maps this intent to the repository workflow, validates the runtime, runs the approved cleanup chain, checks spectrograms and loudness, and applies exact timestamp repair when needed.
+## 测试
 
-## Verification
+运行测试：
 
-Run tests:
+```bash
+pytest -q
+```
+
+或：
 
 ```bash
 python -m unittest discover tests
 ```
 
-Run runtime doctor:
+运行 doctor：
 
 ```bash
 python -m audio_sound.cli doctor
 ```
 
-## Current non-goals
+## 发布包
 
-- exact Adobe Audition parity
-- semantic mouth-click classification
-- GUI editing
-- diarization or ASR workflows
+干净源码压缩包应放在 GitHub Releases 中，不提交到代码目录。
 
-Those can be added later, but the current repository is intentionally centered on stable, automatable audio cleanup.
+推荐生成方式：
+
+```bash
+git archive --format=zip --output tmp/Audio-sound-release-source.zip HEAD
+```
+
+该压缩包只包含 Git 已跟踪源码，不包含 `.env`、`tools/`、`ffmpeg/`、`output/`、`scratch/` 等本地资产。
+
+## 当前不做的事情
+
+- 图形界面剪辑器
+- 完整 ASR 工作台
+- 说话人分离
+- 与 Adobe Audition 完全一致的处理链
+
+这些能力可以后续扩展；当前仓库优先保证中文口播音频清理和删词接缝修复的稳定自动化。
