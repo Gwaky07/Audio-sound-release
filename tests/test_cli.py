@@ -126,6 +126,7 @@ class CliTests(unittest.TestCase):
     def test_pyproject_exposes_audio_skill_workflow_entrypoint(self) -> None:
         pyproject_text = (cli.PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('audio-skill-workflow = "audio_sound.skill_workflow:main"', pyproject_text)
+        self.assertIn('audio-audit-release = "audio_sound.release_audit:main"', pyproject_text)
 
 
 if __name__ == "__main__":

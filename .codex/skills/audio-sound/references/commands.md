@@ -207,3 +207,60 @@ python ../../../scripts/remove_spoken_segments.py run-batch jobs.json
 ```
 
 这个脚本不调用 Respiro-en 或 DeepFilterNet；报告里会明确记录它们未使用。它适合“明确给了时间点、要真正删掉文字”的场景，不替代默认的整体修音 workflow。
+
+## 12. 发布前重复口播与红字闸门
+
+凡是文档红字、重复口播、同音相邻词，或用户报告“最终视频某时间仍有目标词”，上传前必须运行发布审计：
+
+```powershell
+python ../../../scripts/audit_spoken_release.py run `
+  --requirements "<要求映射.json>" `
+  --source-asr "<原片ASR-1.json>" `
+  --source-asr "<原片ASR-2.json>" `
+  --final-asr "<成片ASR-1.json>" `
+  --final-asr "<成片ASR-2.json>" `
+  --segment-report "<segment-removal-report.json>" `
+  --final-media "<最终MP4>" `
+  --final-media "<最终WAV>" `
+  --final-media "<最终MP3>" `
+  --minimum-final-asr-engines 2 `
+  --output "<release-audit.json>"
+```
+
+要求映射最小示例：
+
+```json
+{
+  "source_document_revision": 422,
+  "requirements": [
+    {
+      "id": "red-text-它实践",
+      "target": "它实践",
+      "variants": ["它實踐", "他实践", "他實踐"],
+      "allowed_contexts": ["它这个实践", "它這個實踐", "他这个实践", "他這個實踐"],
+      "source_occurrences": [
+        {"start_seconds": 606.10, "end_seconds": 607.28, "action": "remove"},
+        {"start_seconds": 642.18, "end_seconds": 643.34, "action": "remove"},
+        {"start_seconds": 656.26, "end_seconds": 657.58, "action": "remove"},
+        {"start_seconds": 672.94, "end_seconds": 674.14, "action": "remove"}
+      ],
+      "user_reported_final_timestamps": [554.62, 568.70],
+      "expected_final_occurrences": 0,
+      "minimum_allowed_context_occurrences": 1
+    }
+  ]
+}
+```
+
+规则：
+
+- `source_occurrences` 必须枚举原片中每一遍近似口播；只登记已知 cut 会失败。
+- `allowed_contexts` 用于保留类似“它这个实践”的正确语句，避免把内含目标字符的正常上下文误删。
+- `minimum_allowed_context_occurrences` 用于证明正确保留句仍在；目标词消失但保留句也被吞掉时仍会失败。
+- 若某套 ASR 把已人工核对的保留句同音字识别错（例如把“他这个实践”写成“他这个时间”），只把该完整句加入 `allowed_contexts`；不要把“实践→时间”设成全局 `normalization_replacements`。
+- 审计自动执行 NFKC、常用繁简体、标点和空白归一化；代词或同音词只通过 `variants` 或 `normalization_replacements` 显式配置，不做全局猜测。
+- 任一源片重复项没有被实际 `cuts` 覆盖、最终 ASR 仍命中目标、或用户时间点缺少 ASR 证据时，命令返回非零并写出 `FAIL`。
+- `--final-media` 必须指向真正准备上传的文件；报告会记录文件大小和 SHA-256，换文件后旧审计自动失效。
+- 每个最终 ASR JSON 必须包含 `media`（实际转写文件路径）或 `media_sha256`；其哈希必须与某个 `--final-media` 完全一致。用中间 WAV 转写、再上传另一个正式 WAV/MP4 时会强制失败。
+- 默认至少需要两个不同的最终 ASR `engine` 标签；同一个模型重复跑两遍不算独立复核。只有明确记录本机仅有一套模型时，才可显式降为 `--minimum-final-asr-engines 1`，并在报告中保留该限制。
+- 该报告是 `MODEL-INFERRED` 证据，不等于直接听审；有直接听审工具时仍需完成听审。
