@@ -78,6 +78,39 @@ class DeliveryVerifierTests(unittest.TestCase):
             self.assertFalse(manifest["release_blocked"])
             self.assertEqual(len(manifest["artifacts"]["final_wav"]["sha256"]), 64)
 
+    def test_verify_delivery_fails_closed_when_release_blocked_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source.wav"
+            final_wav = root / "final.wav"
+            report = root / "audio_process_report.json"
+            source.write_bytes(b"source")
+            final_wav.write_bytes(b"wav")
+            payload = _valid_report()
+            del payload["quality_guard"]["release_blocked"]  # type: ignore[index]
+            report.write_text(json.dumps(payload), encoding="utf-8")
+
+            def pair_missing_block(**_: object) -> dict[str, object]:
+                return {
+                    "quality_guard": {
+                        "status": "PASS",
+                        "failures": [],
+                    }
+                }
+
+            manifest = verify_delivery(
+                source=source,
+                final_wav=final_wav,
+                report_json=report,
+                pair_evaluator=pair_missing_block,
+                probe=_probe,
+            )
+
+            self.assertEqual(manifest["status"], "FAIL")
+            self.assertTrue(manifest["release_blocked"])
+            self.assertIn("report_release_blocked", manifest["failures"])
+            self.assertIn("independent_release_blocked", manifest["failures"])
+
     def test_verify_delivery_blocks_invalid_pause_mode_and_pair_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

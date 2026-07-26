@@ -87,9 +87,9 @@ Respiro、DeepFilterNet 和组合模型候选只在运行时真实可用且输�
 
 ## 打包与兼容
 
-`audio_sound` 是主包。`scripts` 作为兼容包一并安装，确保历史 `narrow_onset_cleanup` 模块在 editable install、wheel 和 `git archive` 安装后仍可导入；新业务逻辑应继续向 `audio_sound` 收敛。
+`audio_sound` 是唯一可安装包。仓库根目录 `scripts/*.py` 只是本地 CLI 薄入口，通过 `sys.path` 调用 `audio_sound`；**不得**再把 `scripts` 注册为顶层 setuptools 包，以免污染用户环境中的通用包名。
 
-wheel 内置完整 presets；安装到仓库外的新 venv 后，`audio-cleanup list-presets`、`audio-skill-workflow --dry-run` 与无模型确定性 `final` 链仍可运行。CI 在 Python 3.10/3.11 跑全量测试，并在 Python 3.11 的隔离 wheel 环境执行真实 FFmpeg final smoke 与独立 pair guard。
+wheel 内置完整 presets；安装到仓库外的新 venv 后，`audio-cleanup list-presets`、`audio-skill-workflow --dry-run`、`audio-verify-delivery` 与无模型确定性 `final` 链仍可运行。CI 在 Python 3.10/3.11 跑全量测试，并在 Python 3.11 的隔离 wheel 环境执行真实 FFmpeg final smoke、独立 pair guard 与 verify-delivery 冒烟。
 
 `process_media_file()` 是阶段编排器；停顿清理与呼吸残留闭环分别由 `_run_pause_cleanup()`、`_run_breath_residual_cleanup()` 承担，命令执行统一由 `_run_recorded_command()` 记录和 fail-closed。
 

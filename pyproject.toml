@@ -18,7 +18,7 @@ audio-audit-release = "audio_sound.release_audit:main"
 audio-verify-delivery = "audio_sound.delivery_verifier:main"
 
 [tool.setuptools]
-packages = ["audio_sound", "scripts"]
+packages = ["audio_sound", "audio_sound.presets"]
 
 [tool.setuptools.package-data]
-audio_sound = ["presets/*.json"]
+"audio_sound.presets" = ["*.json"]

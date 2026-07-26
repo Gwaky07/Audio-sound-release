@@ -170,12 +170,12 @@ Do not claim Respiro-en, DeepFilterNet, or SpectraMini were used unless `doctor`
 
 这些规则把“文档里写了”变成“安装与 CI 会挡住”的约束；Agent 改代码时不得绕开：
 
-1. **可安装包**：`pyproject.toml` 提供 `audio-cleanup`、`audio-skill-workflow`、`audio-remove-segments`、`audio-audit-release`、`audio-verify-delivery`。`setup.cmd` 必须 `pip install --editable .` 到仓库 `.venv`。wheel 必须内置 `audio_sound/presets/*.json`；仓库根 `presets/*.json` 是可编辑源，两份内容必须由测试逐字节校验，禁止漂移。
+1. **可安装包**：`pyproject.toml` 只打包 `audio_sound`，提供 `audio-cleanup`、`audio-skill-workflow`、`audio-remove-segments`、`audio-audit-release`、`audio-verify-delivery`。`setup.cmd` 必须 `pip install --editable .` 到仓库 `.venv`。wheel 必须内置 `audio_sound/presets/*.json`；仓库根 `presets/*.json` 是可编辑源，两份内容必须由测试逐字节校验，禁止漂移。仓库 `scripts/` 只是本地 CLI 薄入口，**禁止**再注册为顶层 setuptools 包名 `scripts`。
 2. **Python**：仅 3.10 / 3.11；处理与模型必须用 `.venv\Scripts\python.exe`。
-3. **源码安装冒烟**：CI 必须 `git archive` 后构建 wheel，在检出目录外新建 venv 安装，并至少导入 `audio_sound.auto_workflow`、`audio_sound.agent_judgment`、`audio_sound.skill_workflow`、`audio_sound.narrow_onset_cleanup`、`audio_sound.delivery_verifier`，验证 packaged presets 后再跑 `audio-skill-workflow ... --dry-run`。
-4. **测试门禁**：`.github/workflows/ci.yml` 必须在 Python 3.10 / 3.11 跑全量 `pytest`，并在隔离 wheel 环境用合成口播样本真实执行一次无模型 `final` 确定性链，生成 WAV/MP3、确认格式保持，再做独立 pair guard PASS。不得把完整 `setup.cmd`（含 torch / Respiro 资产）当作 CI 阻断步骤。
+3. **源码安装冒烟**：CI 必须 `git archive` 后构建 wheel，在检出目录外新建 venv 安装，并至少导入 `audio_sound.auto_workflow`、`audio_sound.agent_judgment`、`audio_sound.skill_workflow`、`audio_sound.narrow_onset_cleanup`、`audio_sound.delivery_verifier`，确认顶层 `scripts` 包不存在，验证 packaged presets，再跑 `audio-skill-workflow ... --dry-run` 与 `audio-verify-delivery --help`。
+4. **测试门禁**：`.github/workflows/ci.yml` 必须在 Python 3.10 / 3.11 跑全量 `pytest`，并在隔离 wheel 环境用合成口播样本真实执行一次无模型 `final` 确定性链，生成 WAV/MP3、确认格式保持，再做独立 pair guard PASS 与 `audio-verify-delivery` 冒烟。不得把完整 `setup.cmd`（含 torch / Respiro 资产）当作 CI 阻断步骤。
 5. **运行时诊断门禁**：CI 必须解析 `doctor`，确认 Python 受支持且 Respiro / DeepFilterNet capability state 字段存在。缺少 bundled `tools/`、仓库内 `ffmpeg/`、模型权重时，模型 `ready=false` 是可接受事实，但不得伪造 ready，也不得让无模型单元测试失败。
-6. **对比与验证模块**：`scripts/evaluate_audio_pair.py` 是薄入口，核心在 `audio_sound/pair_evaluation.py`；独立无排除对比与 `verify_delivery` 不得传授权排除窗口来“洗绿”报告。
+6. **对比与验证模块**：`scripts/evaluate_audio_pair.py` 是薄入口，核心在 `audio_sound/pair_evaluation.py`；独立无排除对比与 `verify_delivery` 不得传授权排除窗口来“洗绿”报告。`quality_guard.release_blocked` 缺失时必须 fail-closed 视为 `True`；测试与 CI 必须锁住该默认。
 7. **禁止提交**：`.venv/`、`.env`、`tools/`、`output/`、`scratch/`、`.omx/`、`__pycache__/`、`*.egg-info/`；分享前可跑 `python scripts/audio_cleanup.py clean-repo`。
 
 ## Mandatory Audio Self-Audit Before Completion

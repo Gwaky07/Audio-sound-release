@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,27 @@ AUDIO_PACKAGE = PROJECT_ROOT / "audio_sound"
 
 
 class ArchitectureContractTests(unittest.TestCase):
+    def test_setuptools_does_not_install_generic_scripts_package(self) -> None:
+        text = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r"^packages\s*=\s*\[([^\]]*)\]", text, flags=re.MULTILINE)
+        self.assertIsNotNone(match)
+        packages = [
+            item.strip().strip("'\"")
+            for item in str(match.group(1)).split(",")
+            if item.strip()
+        ]
+        self.assertEqual(packages, ["audio_sound", "audio_sound.presets"])
+        self.assertFalse((PROJECT_ROOT / "scripts" / "__init__.py").exists())
+        # Guard against reintroducing a top-level package that would collide with
+        # the generic name "scripts" in user environments / site-packages.
+        self.assertNotRegex(
+            text,
+            r'packages\s*=\s*\[[^\]]*["\']scripts["\']',
+        )
+        self.assertTrue(
+            (PROJECT_ROOT / "audio_sound" / "presets" / "__init__.py").exists()
+        )
+
     def test_process_media_file_remains_an_orchestrator(self) -> None:
         source_lines, _ = inspect.getsourcelines(pipeline.process_media_file)
         self.assertLessEqual(
