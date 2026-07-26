@@ -112,7 +112,15 @@ def _guard(
     sample_rate: int = SAMPLE_RATE,
     reference_format: dict[str, object] | None = None,
     processed_format: dict[str, object] | None = None,
+    sample_level: bool = False,
 ) -> dict[str, object]:
+    """Run the real analyzer, then the real guard.
+
+    ``sample_level`` mirrors how the guard is actually called: PCM is handed over
+    only when the sample-level checks (hard mute, spectral bands) are needed.
+    Those checks run a 2048-point O(n^2) DFT, so tests that only exercise
+    frame- or format-level failures deliberately leave it off.
+    """
     reference_analysis = analyze_pcm16_samples(
         reference, sample_rate=sample_rate, frame_ms=FRAME_MS
     )
@@ -124,9 +132,9 @@ def _guard(
         processed_analysis,
         reference_format=reference_format,
         processed_format=processed_format,
-        reference_samples=reference,
-        processed_samples=processed,
-        sample_rate=sample_rate,
+        reference_samples=reference if sample_level else None,
+        processed_samples=processed if sample_level else None,
+        sample_rate=sample_rate if sample_level else None,
     )
 
 
@@ -134,9 +142,11 @@ class GuardBaselineTests(unittest.TestCase):
     """The guard must not cry wolf, or every real failure gets ignored."""
 
     def test_identical_audio_passes(self) -> None:
+        """Covers the sample-level path too: a false positive here would make
+        every other guard result meaningless."""
         samples = _speech_like_samples()
 
-        guard = _guard(samples, array("h", samples))
+        guard = _guard(samples, array("h", samples), sample_level=True)
 
         self.assertEqual(guard["status"], "PASS")
         self.assertFalse(guard["release_blocked"])
@@ -167,7 +177,7 @@ class InjectedDamageDetectionTests(unittest.TestCase):
             reference, cutoff_hz=2200.0, sample_rate=SAMPLE_RATE
         )
 
-        guard = _guard(reference, processed)
+        guard = _guard(reference, processed, sample_level=True)
 
         self.assertEqual(guard["status"], "FAIL")
         self.assertTrue(guard["release_blocked"])
@@ -179,7 +189,7 @@ class InjectedDamageDetectionTests(unittest.TestCase):
             reference, cutoff_hz=4000.0, gain_db=9.0, sample_rate=SAMPLE_RATE
         )
 
-        guard = _guard(reference, processed)
+        guard = _guard(reference, processed, sample_level=True)
 
         self.assertEqual(guard["status"], "FAIL")
         self.assertTrue(guard["release_blocked"])
@@ -193,7 +203,7 @@ class InjectedDamageDetectionTests(unittest.TestCase):
         for index in range(start, end):
             processed[index] = 0
 
-        guard = _guard(reference, processed)
+        guard = _guard(reference, processed, sample_level=True)
 
         self.assertEqual(guard["status"], "FAIL")
         self.assertTrue(guard["release_blocked"])
@@ -285,7 +295,7 @@ class GuardBlindSpotBoundaryTests(unittest.TestCase):
             reference, cutoff_hz=4000.0, gain_db=1.0, sample_rate=SAMPLE_RATE
         )
 
-        guard = _guard(reference, processed)
+        guard = _guard(reference, processed, sample_level=True)
 
         self.assertNotIn("spectral_harshness_increased", guard["failures"])
 
@@ -305,7 +315,7 @@ class GuardBlindSpotBoundaryTests(unittest.TestCase):
             previous_output = output
             processed.append(int(max(-32768, min(32767, round(output)))))
 
-        guard = _guard(reference, processed)
+        guard = _guard(reference, processed, sample_level=True)
 
         self.assertNotIn("spectral_clarity_lost", guard["failures"])
         self.assertNotIn("spectral_harshness_increased", guard["failures"])
