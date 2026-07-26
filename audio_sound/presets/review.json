@@ -1,0 +1,76 @@
+{
+  "name": "review",
+  "description": "Cleanup plus heuristic review markers for spoken-word QA and manual spot checks.",
+  "notes": [
+    "Use when you want cleaned output and a shortlist of candidate pause or breath regions.",
+    "The report is heuristic and should be treated as review assistance, not semantic speech understanding."
+  ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.064,
+        "min_length_ms": 20
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.5,
+        "breath_control_sensitivity": 0.5,
+        "mouth_declick_sensitivity": 0.6
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
+  "extract": {
+    "sample_rate": 48000,
+    "channels": 1,
+    "pcm_codec": "pcm_s16le"
+  },
+  "filters": {
+    "highpass_hz": 70,
+    "lowpass_hz": 12000,
+    "secondary_denoise": {
+      "enabled": true,
+      "nr": 10,
+      "nf": -26,
+      "tracking": true
+    },
+    "gate": {
+      "enabled": true,
+      "threshold": 0.016,
+      "ratio": 2.2,
+      "attack_ms": 12,
+      "release_ms": 240,
+      "makeup_db": 0
+    },
+    "compressor": {
+      "enabled": true,
+      "threshold_db": -18,
+      "ratio": 2.0,
+      "attack_ms": 12,
+      "release_ms": 140,
+      "makeup_db": 1
+    },
+    "loudnorm": {
+      "target_i": -16.8,
+      "target_lra": 7.0,
+      "target_tp": -3.0
+    }
+  },
+  "analysis": {
+    "silence_candidates": true,
+    "silence_threshold_db": -38,
+    "silence_min_duration": 0.1
+  },
+  "transcript_export": {
+    "codec": "libmp3lame",
+    "bitrate": "192k"
+  }
+}

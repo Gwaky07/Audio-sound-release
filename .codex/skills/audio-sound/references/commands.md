@@ -12,13 +12,15 @@ python ../../../scripts/audio_cleanup.py doctor
 python ../../../scripts/audio_skill_workflow.py describe-modes
 ```
 
-## 3. 默认严格成品模式
+## 3. 默认自动优选模式
 
 这是本 skill 的默认最终交付入口：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>"
 ```
+
+等价于 `--mode auto`：先跑 `natural` 基线，再按诊断尝试白名单增强候选；全部硬守门通过才自动交付，否则回退自然版。
 
 最终音频默认只看：
 
@@ -29,16 +31,36 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode refe
 
 如果同名已存在，会自动生成 `_01`、`_02`。中间 wav/mp3 默认清理掉，只保留报告和频谱证据。
 
+报告中的 `input_diagnostics` 说明系统识别到的底噪、削波、动态和候选噪声窗口；`adaptive_profile` 只能是 `baseline`、`leveling_gentle`、`noise_review`、`manual_review`；`breath_cleanup` 记录 Respiro、辅助频谱证据、底噪目标衰减、母带后补处理和最终残留；`quality_guard` 检查声道、采样率、时长、吞字风险、源活跃硬静音、高频清晰度损失、局部相关性、削波增加和短时音量异常。`auto_selection` 还记录 `capability_plan`、`repair_scorecard`、`delivery_incomplete_for_repair_intent`、`model_applied`、`model_succeeded`、`fallback_used`、`benefit_score`、`harm_score`、淘汰原因和回退理由。修音意图下若胜出 `natural_baseline`，`delivery_incomplete_for_repair_intent` 必须为 `true`。`breath_cleanup.status != PASS` 或 `release_blocked=true` 时不应交付。
+
+默认处理会保留源采样率和声道数。双声道只在诊断时临时下混分析，最终 WAV/MP3 仍应为双声道。Codex/GPT 只负责从固定安全白名单中选择和解释，不能直接生成任意 DSP 参数。Respiro 与 DeepFilterNet 只在缺陷证据和 `doctor` 能力满足时作为固定候选运行；门限、硬静音和强降噪仍禁止自动开启。
+
+可选双 ASR 证据：
+
+```bash
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --source-asr source-a.json --source-asr source-b.json --candidate-asr cand-a.json --candidate-asr cand-b.json
+```
+
+清晰度候选和双模型组合缺少可绑定 ASR 证据时只能回退 `natural`；单模型候选无 ASR 时必须通过更严格的衰减、频谱和局部相关性守门。ASR 冲突转人工复核。
+
 如果要排查阶段问题，才保留中间音频：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --keep-intermediate-audio
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --keep-intermediate-audio
 ```
 
-## 4. 更自然的低响度口播模式
+同源前后对比回归：
+
+```bash
+python ../../../scripts/evaluate_audio_pair.py --source "<原音>" --processed "<成品>" --output "../../../scratch/pair-report.json"
+```
+
+## 4. 旧版呼吸清理风格
 
 ```bash
 python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-style
+
+`reference-legacy` 仅用于明确要求复现旧交付或问题对照，不得作为新成品默认模式。
 ```
 
 ## 5. 带局部频谱窗口的运行方式
@@ -46,13 +68,13 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode refe
 当你已经知道要重点看哪些节点时：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --focus-window 节点A,234.8,1.4 --focus-window 节点B,530.3,1.1
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --focus-window 节点A,234.8,1.4 --focus-window 节点B,530.3,1.1
 ```
 
 排查“开头突然多出来声音”和“某个字断开/吞字”时，必须带 focus-window：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --focus-window start_artifact_1s,0.75,0.9 --focus-window zishi_12s,11.65,1.25
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --focus-window start_artifact_1s,0.75,0.9 --focus-window zishi_12s,11.65,1.25
 ```
 
 运行后重点检查：
@@ -118,7 +140,8 @@ workflow_report = next(root.rglob("skill-file-report.json"))
 core = json.loads(core_report.read_text(encoding="utf-8"))
 workflow = json.loads(workflow_report.read_text(encoding="utf-8"))
 files = {
-    "raw_after_respiro_spectra": Path(core["outputs"]["raw_wav"]),
+    "raw_source": Path(core["outputs"]["raw_wav"]),
+    "breath_stage": Path(core["outputs"]["breath_wav"]),
     "deepfilternet": Path(core["outputs"]["denoised_wav"]),
     "mastered": Path(core["outputs"]["clean_wav"]),
     "delivered": Path(workflow["deliverables"]["wav"]),
@@ -207,3 +230,60 @@ python ../../../scripts/remove_spoken_segments.py run-batch jobs.json
 ```
 
 这个脚本不调用 Respiro-en 或 DeepFilterNet；报告里会明确记录它们未使用。它适合“明确给了时间点、要真正删掉文字”的场景，不替代默认的整体修音 workflow。
+
+## 12. 发布前重复口播与红字闸门
+
+凡是文档红字、重复口播、同音相邻词，或用户报告“最终视频某时间仍有目标词”，上传前必须运行发布审计：
+
+```powershell
+python ../../../scripts/audit_spoken_release.py run `
+  --requirements "<要求映射.json>" `
+  --source-asr "<原片ASR-1.json>" `
+  --source-asr "<原片ASR-2.json>" `
+  --final-asr "<成片ASR-1.json>" `
+  --final-asr "<成片ASR-2.json>" `
+  --segment-report "<segment-removal-report.json>" `
+  --final-media "<最终MP4>" `
+  --final-media "<最终WAV>" `
+  --final-media "<最终MP3>" `
+  --minimum-final-asr-engines 2 `
+  --output "<release-audit.json>"
+```
+
+要求映射最小示例：
+
+```json
+{
+  "source_document_revision": 422,
+  "requirements": [
+    {
+      "id": "red-text-它实践",
+      "target": "它实践",
+      "variants": ["它實踐", "他实践", "他實踐"],
+      "allowed_contexts": ["它这个实践", "它這個實踐", "他这个实践", "他這個實踐"],
+      "source_occurrences": [
+        {"start_seconds": 606.10, "end_seconds": 607.28, "action": "remove"},
+        {"start_seconds": 642.18, "end_seconds": 643.34, "action": "remove"},
+        {"start_seconds": 656.26, "end_seconds": 657.58, "action": "remove"},
+        {"start_seconds": 672.94, "end_seconds": 674.14, "action": "remove"}
+      ],
+      "user_reported_final_timestamps": [554.62, 568.70],
+      "expected_final_occurrences": 0,
+      "minimum_allowed_context_occurrences": 1
+    }
+  ]
+}
+```
+
+规则：
+
+- `source_occurrences` 必须枚举原片中每一遍近似口播；只登记已知 cut 会失败。
+- `allowed_contexts` 用于保留类似“它这个实践”的正确语句，避免把内含目标字符的正常上下文误删。
+- `minimum_allowed_context_occurrences` 用于证明正确保留句仍在；目标词消失但保留句也被吞掉时仍会失败。
+- 若某套 ASR 把已人工核对的保留句同音字识别错（例如把“他这个实践”写成“他这个时间”），只把该完整句加入 `allowed_contexts`；不要把“实践→时间”设成全局 `normalization_replacements`。
+- 审计自动执行 NFKC、常用繁简体、标点和空白归一化；代词或同音词只通过 `variants` 或 `normalization_replacements` 显式配置，不做全局猜测。
+- 任一源片重复项没有被实际 `cuts` 覆盖、最终 ASR 仍命中目标、或用户时间点缺少 ASR 证据时，命令返回非零并写出 `FAIL`。
+- `--final-media` 必须指向真正准备上传的文件；报告会记录文件大小和 SHA-256，换文件后旧审计自动失效。
+- 每个最终 ASR JSON 必须包含 `media`（实际转写文件路径）或 `media_sha256`；其哈希必须与某个 `--final-media` 完全一致。用中间 WAV 转写、再上传另一个正式 WAV/MP4 时会强制失败。
+- 默认至少需要两个不同的最终 ASR `engine` 标签；同一个模型重复跑两遍不算独立复核。只有明确记录本机仅有一套模型时，才可显式降为 `--minimum-final-asr-engines 1`，并在报告中保留该限制。
+- 该报告是 `MODEL-INFERRED` 证据，不等于直接听审；有直接听审工具时仍需完成听审。

@@ -1,0 +1,307 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install test runtime
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -e .
+
+      - name: Run tests
+        shell: pwsh
+        run: python -m pytest -q
+
+      - name: Smoke-test default auto plan
+        shell: pwsh
+        run: audio-skill-workflow run placeholder.wav --mode auto --dry-run
+
+      - name: Record doctor capabilities
+        shell: pwsh
+        run: |
+          $doctor = audio-cleanup doctor | ConvertFrom-Json
+          if (-not $doctor.python.ok) { throw "doctor could not inspect Python" }
+          if (-not $doctor.python.supported) { throw "unsupported Python runtime" }
+          if ($null -eq $doctor.respiro_en.ready) { throw "missing Respiro capability state" }
+          if ($null -eq $doctor.deepfilternet.ready) { throw "missing DeepFilterNet capability state" }
+
+  wheel-and-real-chain:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Ensure FFmpeg runtime
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --no-progress -y
+          }
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Build wheel from git archive
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          $archive = Join-Path $env:RUNNER_TEMP "audio-sound.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "audio-sound-archive"
+          $wheelDir = Join-Path $env:RUNNER_TEMP "wheelhouse"
+          git archive --format=zip --output=$archive HEAD
+          Expand-Archive -Path $archive -DestinationPath $extract
+          python -m build --wheel $extract --outdir $wheelDir
+
+      - name: Install wheel outside checkout
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          python -m venv $venv
+          $python = Join-Path $venv "Scripts\python.exe"
+          $wheel = Get-ChildItem (Join-Path $env:RUNNER_TEMP "wheelhouse") -Filter "*.whl" | Select-Object -First 1
+          & $python -m pip install $wheel.FullName
+          Push-Location $env:RUNNER_TEMP
+          & $python -c "import audio_sound.auto_workflow, audio_sound.agent_judgment, audio_sound.skill_workflow, audio_sound.narrow_onset_cleanup, audio_sound.delivery_verifier"
+          & $python -c @"
+          import zipfile
+          from pathlib import Path
+          import site
+          wheel = Path(r'$($wheel.FullName)')
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+          assert any(name.startswith('audio_sound/') for name in names)
+          assert not any(name.startswith('scripts/') for name in names), names
+          for root in site.getsitepackages():
+              candidate = Path(root) / 'scripts'
+              assert not (candidate / '__init__.py').exists(), candidate
+              assert not (candidate / 'narrow_onset_cleanup.py').exists(), candidate
+          "@
+          $presets = & (Join-Path $venv "Scripts\audio-cleanup.exe") list-presets
+          if ("final" -notin $presets -or "natural" -notin $presets) {
+            throw "wheel is missing packaged presets"
+          }
+          & (Join-Path $venv "Scripts\audio-skill-workflow.exe") run placeholder.wav --mode auto --dry-run
+          & (Join-Path $venv "Scripts\audio-verify-delivery.exe") --help | Out-Null
+          Pop-Location
+
+      - name: Run deterministic final chain from installed wheel
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          $python = Join-Path $venv "Scripts\python.exe"
+          $cleanup = Join-Path $venv "Scripts\audio-cleanup.exe"
+          $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
+          $output = Join-Path $env:RUNNER_TEMP "ci-real-chain"
+          @'
+          import math, struct, sys, wave
+          sample = sys.argv[1]
+          sample_rate = 16000
+          samples = []
+          for index in range(sample_rate * 8):
+              time_s = index / sample_rate
+              active = (
+                  0.5 <= time_s < 2.5
+                  or 3.0 <= time_s < 5.0
+                  or 5.5 <= time_s < 7.5
+              )
+              if active:
+                  envelope = 0.55 + 0.35 * math.sin(
+                      2 * math.pi * 3.2 * time_s
+                  ) ** 2
+                  value = envelope * (
+                      0.55 * math.sin(2 * math.pi * 180 * time_s)
+                      + 0.28 * math.sin(2 * math.pi * 360 * time_s)
+                      + 0.12 * math.sin(2 * math.pi * 720 * time_s)
+                  )
+                  pcm = int(max(-1.0, min(1.0, value)) * 12000)
+              else:
+                  pcm = int(8 * math.sin(2 * math.pi * 73 * time_s))
+              samples.append(pcm)
+          with wave.open(sample, "wb") as output:
+              output.setnchannels(1)
+              output.setsampwidth(2)
+              output.setframerate(sample_rate)
+              output.writeframes(
+                  struct.pack("<" + "h" * len(samples), *samples)
+              )
+          '@ | & $python - $sample
+          & $cleanup clean $sample --preset final --skip-spectramini --skip-deepfilternet --output-dir $output
+          $report = Get-ChildItem $output -Recurse -Filter "audio_process_report.json" | Select-Object -First 1
+          if (-not $report) { throw "real-chain report was not generated" }
+          $payload = Get-Content $report.FullName -Raw | ConvertFrom-Json
+          if ($payload.dry_run) { throw "real chain unexpectedly used dry-run" }
+          if ($payload.preset_name -ne "final") { throw "final preset was not used" }
+          if (-not $payload.channel_layout_preserved) { throw "channel layout changed" }
+          if (-not (Test-Path $payload.outputs.clean_wav)) { throw "final WAV is missing" }
+          if (-not (Test-Path $payload.outputs.transcript_mp3)) { throw "final MP3 is missing" }
+          $pair = Join-Path $env:RUNNER_TEMP "ci-pair.json"
+          $source = $sample
+          $processed = $payload.outputs.clean_wav
+          @'
+          import json, sys
+          from pathlib import Path
+          from audio_sound.pair_evaluation import evaluate_audio_pair
+          report = evaluate_audio_pair(
+              source=Path(sys.argv[1]),
+              processed=Path(sys.argv[2]),
+          )
+          Path(sys.argv[3]).write_text(
+              json.dumps(report, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          if report["quality_guard"]["status"] != "PASS":
+              raise SystemExit(1)
+          '@ | & $python - $source $processed $pair
+          $verifyReport = Join-Path $env:RUNNER_TEMP "ci-verify-report.json"
+          $verifyOut = Join-Path $env:RUNNER_TEMP "ci-delivery-verification.json"
+          $mp3 = $payload.outputs.transcript_mp3
+          @'
+          import json, sys
+          from pathlib import Path
+          source, wav, mp3, process_report, verify_report = map(Path, sys.argv[1:6])
+          payload = json.loads(process_report.read_text(encoding="utf-8"))
+          payload["quality_guard"] = {
+              "status": "PASS",
+              "release_blocked": False,
+              "failures": [],
+          }
+          payload["breath_cleanup"] = {
+              "status": "PASS",
+              "final_residual_windows": [],
+              "failures": [],
+          }
+          payload["pause_cleanup"] = {
+              "status": "PASS",
+              "mode": "speech_safe_autogate",
+              "allow_bridge_windows": False,
+              "final_residual_windows": [],
+              "failures": [],
+          }
+          payload["deliverables"] = {"wav": str(wav), "mp3": str(mp3)}
+          verify_report.write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          '@ | & $python - $source $processed $mp3 $report.FullName $verifyReport
+          & (Join-Path $venv "Scripts\audio-verify-delivery.exe") `
+            --source $source `
+            --final-wav $processed `
+            --final-mp3 $mp3 `
+            --report $verifyReport `
+            --output $verifyOut
+          $manifest = Get-Content $verifyOut -Raw | ConvertFrom-Json
+          if ($manifest.status -ne "PASS") { throw "audio-verify-delivery smoke failed" }
+          if ($manifest.release_blocked) { throw "audio-verify-delivery unexpectedly blocked" }
+
+      - name: Prove the delivery gate actually blocks
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          $python = Join-Path $venv "Scripts\python.exe"
+          $verify = Join-Path $venv "Scripts\audio-verify-delivery.exe"
+          $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
+          $passReport = Join-Path $env:RUNNER_TEMP "ci-verify-report.json"
+          $payload = Get-Content $passReport -Raw | ConvertFrom-Json
+          $wav = $payload.deliverables.wav
+          $mp3 = $payload.deliverables.mp3
+
+          # Each mutation below takes the exact report that just passed and breaks
+          # one thing. A gate that cannot fail is not a gate, so every case must
+          # exit nonzero and set release_blocked.
+          $mutations = @(
+            @{ name = "release_blocked_true"; expect = "report_release_blocked" },
+            @{ name = "release_blocked_absent"; expect = "report_release_blocked" },
+            @{ name = "quality_guard_absent"; expect = "report_release_blocked" },
+            @{ name = "guard_failures_present"; expect = "report_quality_guard_failures" },
+            @{ name = "breath_residual_present"; expect = "report_breath_residuals_present" },
+            @{ name = "pause_mode_invalid"; expect = "report_pause_mode_invalid" },
+            @{ name = "pause_bridge_enabled"; expect = "report_pause_bridge_not_disabled" }
+          )
+
+          foreach ($mutation in $mutations) {
+            $broken = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name).json"
+            $out = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name)-manifest.json"
+            @'
+            import json, sys
+            from pathlib import Path
+            source_report, target, mutation = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+            payload = json.loads(source_report.read_text(encoding="utf-8"))
+            if mutation == "release_blocked_true":
+                payload["quality_guard"]["release_blocked"] = True
+            elif mutation == "release_blocked_absent":
+                payload["quality_guard"].pop("release_blocked", None)
+            elif mutation == "quality_guard_absent":
+                payload.pop("quality_guard", None)
+            elif mutation == "guard_failures_present":
+                payload["quality_guard"]["failures"] = ["spectral_clarity_lost"]
+            elif mutation == "breath_residual_present":
+                payload["breath_cleanup"]["final_residual_windows"] = [[1.0, 1.2]]
+            elif mutation == "pause_mode_invalid":
+                payload["pause_cleanup"]["mode"] = "legacy_hard_gate"
+            elif mutation == "pause_bridge_enabled":
+                payload["pause_cleanup"]["allow_bridge_windows"] = True
+            else:
+                raise SystemExit(f"unknown mutation {mutation}")
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            '@ | & $python - $passReport $broken $mutation.name
+
+            & $verify --source $sample --final-wav $wav --final-mp3 $mp3 `
+              --report $broken --output $out
+            $code = $LASTEXITCODE
+            if ($code -eq 0) {
+              throw "mutation '$($mutation.name)' was NOT blocked (exit 0)"
+            }
+            $result = Get-Content $out -Raw | ConvertFrom-Json
+            if (-not $result.release_blocked) {
+              throw "mutation '$($mutation.name)' left release_blocked false"
+            }
+            if ($result.status -ne "FAIL") {
+              throw "mutation '$($mutation.name)' did not report FAIL"
+            }
+            if ($mutation.expect -notin $result.failures) {
+              throw "mutation '$($mutation.name)' missing expected failure '$($mutation.expect)'; got: $($result.failures -join ',')"
+            }
+            Write-Host "blocked as expected: $($mutation.name) -> $($mutation.expect)"
+          }
+
+      - name: Prove a missing deliverable blocks
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          $verify = Join-Path $venv "Scripts\audio-verify-delivery.exe"
+          $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
+          $passReport = Join-Path $env:RUNNER_TEMP "ci-verify-report.json"
+          $out = Join-Path $env:RUNNER_TEMP "ci-missing-manifest.json"
+          $absent = Join-Path $env:RUNNER_TEMP "definitely-not-here.wav"
+          & $verify --source $sample --final-wav $absent --report $passReport --output $out
+          if ($LASTEXITCODE -eq 0) { throw "missing final WAV was not blocked" }
+          $result = Get-Content $out -Raw | ConvertFrom-Json
+          if (-not $result.release_blocked) { throw "missing final WAV left release_blocked false" }
+          Write-Host "blocked as expected: missing final WAV"

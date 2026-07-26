@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from array import array
+from pathlib import Path
 
 from audio_sound.pipeline import NoiseWindow
 from audio_sound.skill_workflow import (
@@ -10,6 +11,7 @@ from audio_sound.skill_workflow import (
     HardMuteCleanupConfig,
     ResidueCleanupConfig,
     build_parser,
+    build_workflow_dry_run,
     parse_exact_duck_window,
     parse_exact_mute_window,
     build_hardmute_cleanup_windows_from_silences,
@@ -17,6 +19,8 @@ from audio_sound.skill_workflow import (
     build_residue_cleanup_windows_from_silences,
     describe_modes,
     _delivery_label,
+    _build_final_delivery_guard,
+    _finalize_workflow_file,
     _final_delivery_label,
     _prune_intermediate_audio,
     _reserve_delivery_paths,
@@ -26,12 +30,113 @@ from audio_sound.skill_workflow import (
 
 
 class SkillWorkflowTests(unittest.TestCase):
+    def test_auto_dry_run_loads_required_candidates_and_capability_plan(self) -> None:
+        payload = build_workflow_dry_run(Path("placeholder.wav"), "auto")
+
+        self.assertTrue(payload["dry_run"])
+        self.assertIn("natural_baseline", payload["candidate_ids"])
+        self.assertIn("final_repair_best", payload["candidate_ids"])
+        self.assertEqual(payload["capability_plan"]["primary_candidate"], "final_repair_best")
+
+    def test_final_delivery_guard_blocks_local_speech_loss(self) -> None:
+        import tempfile
+        import wave
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            reference_wav = root / "reference.wav"
+            delivered_wav = root / "delivered.wav"
+
+            def write_wav(path: Path, samples: array) -> None:
+                with wave.open(str(path), "wb") as writer:
+                    writer.setnchannels(1)
+                    writer.setsampwidth(2)
+                    writer.setframerate(1000)
+                    writer.writeframes(samples.tobytes())
+
+            write_wav(reference_wav, array("h", [6000] * 2000))
+            write_wav(
+                delivered_wav,
+                array("h", [6000] * 500 + [1000] * 500 + [10000] * 500 + [6000] * 500),
+            )
+
+            guard = _build_final_delivery_guard(reference_wav, delivered_wav)
+
+            self.assertEqual(guard["status"], "FAIL")
+            self.assertTrue(guard["release_blocked"])
+
+    def test_final_delivery_guard_accepts_preserved_stereo_format(self) -> None:
+        import tempfile
+        import wave
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            reference_wav = root / "reference.wav"
+            delivered_wav = root / "delivered.wav"
+            stereo_samples = array("h", [6000, 3000] * 2000)
+
+            for path in (reference_wav, delivered_wav):
+                with wave.open(str(path), "wb") as writer:
+                    writer.setnchannels(2)
+                    writer.setsampwidth(2)
+                    writer.setframerate(44100)
+                    writer.writeframes(stereo_samples.tobytes())
+
+            guard = _build_final_delivery_guard(reference_wav, delivered_wav)
+
+            self.assertEqual(guard["status"], "PASS")
+            self.assertEqual(guard["processed_format"]["channels"], 2)
+            self.assertEqual(guard["processed_format"]["sample_rate"], 44100)
+
+    def test_finalize_workflow_blocks_failed_preservation_guard_before_delivery(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "active_speech_attenuated"):
+            _finalize_workflow_file(
+                core_report={
+                    "input_file": "D:/audio/voice.wav",
+                    "quality_guard": {
+                        "status": "FAIL",
+                        "release_blocked": True,
+                        "failures": ["active_speech_attenuated"],
+                    },
+                },
+                mode=resolve_mode("natural"),
+                ffmpeg_bin="ffmpeg",
+                reference_target_lufs=-19.0,
+                focus_windows=[],
+                exact_mute_windows=[],
+                exact_duck_windows=[],
+                skip_spectrograms=True,
+                skip_bridge_cleanup=True,
+                delivery_dir=__import__("pathlib").Path("D:/delivery"),
+                delivery_prefix="修音版",
+                spectrogram_start=0.0,
+                spectrogram_duration=30.0,
+                run_slug="20260723-120000",
+            )
+
     def test_describe_modes_returns_reference_style(self) -> None:
         payload = describe_modes("reference-style")
         self.assertEqual(payload["name"], "reference-style")
         self.assertEqual(payload["preset_name"], "fast")
         self.assertTrue(payload["apply_narrow_cleanup"])
         self.assertTrue(payload["apply_bridge_cleanup"])
+
+    def test_describe_modes_returns_natural_default(self) -> None:
+        payload = describe_modes("natural")
+        self.assertEqual(payload["name"], "natural")
+        self.assertEqual(payload["preset_name"], "natural")
+        self.assertEqual(payload["attenuation_db"], 0.0)
+        self.assertFalse(payload["apply_narrow_cleanup"])
+        self.assertFalse(payload["apply_bridge_cleanup"])
+
+    def test_describe_modes_returns_bounded_enhanced_final(self) -> None:
+        payload = describe_modes("final")
+        self.assertEqual(payload["preset_name"], "final")
+        self.assertEqual(payload["attenuation_db"], 3.0)
+        self.assertEqual(payload["suffix"], "增强修音终版")
+        self.assertIn("clarity EQ", payload["description"])
 
     def test_resolve_mode_returns_known_mode(self) -> None:
         mode = resolve_mode("voice-isolate")
@@ -46,10 +151,46 @@ class SkillWorkflowTests(unittest.TestCase):
         self.assertFalse(payload["apply_narrow_cleanup"])
         self.assertFalse(payload["apply_bridge_cleanup"])
 
-    def test_run_parser_defaults_to_reference_legacy(self) -> None:
+    def test_describe_modes_returns_guarded_auto_mode(self) -> None:
+        payload = describe_modes("auto")
+        self.assertEqual(payload["preset_name"], "natural")
+        self.assertEqual(payload["suffix"], "自动优选版")
+        self.assertIn("candidate", payload["description"])
+
+    def test_run_parser_defaults_to_auto(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["run", "demo.wav"])
-        self.assertEqual(args.mode, "reference-legacy")
+        self.assertEqual(args.mode, "auto")
+
+    def test_auto_selection_falls_back_when_enhancement_blocked(self) -> None:
+        from audio_sound.auto_workflow import build_evaluated_candidate, select_auto_candidate
+
+        baseline = build_evaluated_candidate(
+            candidate_id="natural_baseline",
+            requires_asr=False,
+            quality_guard={
+                "release_blocked": False,
+                "failures": [],
+                "worst_relative_attenuation_db": -0.4,
+                "relative_gain_spread_db": 1.5,
+                "spectral_band_deltas_db": {},
+            },
+        )
+        clarity = build_evaluated_candidate(
+            candidate_id="clarity_leveling_safe",
+            requires_asr=True,
+            quality_guard={
+                "release_blocked": False,
+                "failures": [],
+                "worst_relative_attenuation_db": -0.2,
+                "relative_gain_spread_db": 1.0,
+                "spectral_band_deltas_db": {},
+            },
+        )
+        selected = select_auto_candidate([baseline, clarity], repair_intent=True)
+        self.assertEqual(selected["candidate_id"], "natural_baseline")
+        self.assertEqual(selected["selection_reason"], "safe_fallback_incomplete")
+        self.assertTrue(selected["delivery_incomplete_for_repair_intent"])
 
     def test_parse_focus_window_accepts_label_start_duration(self) -> None:
         window = parse_focus_window("pause_a,12,3")

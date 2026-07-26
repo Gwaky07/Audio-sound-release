@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 set "FFMPEG_BIN=ffmpeg"
 set "FFPROBE_BIN=ffprobe"
 if exist "%~dp0ffmpeg\bin\ffmpeg.exe" (

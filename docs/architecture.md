@@ -1,106 +1,98 @@
-# Architecture
+# 架构
 
-## Goal
+## 目标与权威入口
 
-Make `Audio-sound` a standalone audio processing repository that can be called directly from Codex or from the shell, with no runtime dependence on another local repository.
+本仓库提供可独立安装、可由 Agent 或 shell 调用的中文口播修音流程，不依赖其他本地仓库。
 
-## Layers
+最终成品的权威入口是：
 
-### 1. Skill layer
+```powershell
+run_audio_workflow.cmd "<input-audio>"
+```
 
-Location:
+它固定使用仓库 `.venv` 并调用 `scripts/audio_skill_workflow.py run`。`scripts/audio_cleanup.py` / `audio_sound.cli` 是检查、安装、底层预设控制和排障入口，不是 Best Repair 默认交付路径。
 
-- `.codex/skills/audio-sound/`
+## 分层
 
-Responsibility:
+### 1. Agent 规约与 Skill
 
-- map natural-language intent to the approved workflow mode and the minimum required CLI overrides
-- keep Codex invocation stable even as the processing internals evolve
-- cover both first-pass delivery and exact timestamp repair in one repository-local entry
+- `AGENTS.md`：能力契约、发布阻断规则和强制自查清单
+- `.codex/skills/audio-sound/`：Codex/Agent 的意图映射与命令参考
+- `CLAUDE.md`、`.claude/skills/audio-sound/`：Claude Code 的轻量转发入口
 
-### 2. Bootstrap layer
+规约定义“允许交付什么”；代码中的 `release_blocked`、候选淘汰原因和独立验证负责执行这些规则。
 
-Location:
+### 2. 稳定工作流与候选编排
+
+- `audio_sound/skill_workflow.py`：稳定的最终交付入口、报告和 WAV/MP3 命名
+- `audio_sound/auto_workflow.py`：固定候选集合、候选评估与选择
+- `audio_sound/agent_judgment.py`：`capability_plan`、`repair_scorecard` 和修音意图完成度
+
+默认 `auto` 至少竞争：
+
+1. `natural_baseline`
+2. `final_repair_best`
+
+Respiro、DeepFilterNet 和组合模型候选只在运行时真实可用且输入证据满足时加入。`natural_baseline` 只能作为安全回退，不能冒充修音意图完成。
+
+### 3. 确定性处理与质量守门
+
+- `audio_sound/pipeline.py`：媒体探测、格式保持、确定性修音、报告和 preservation guard
+- `audio_sound/media_utils.py`：唯一的 PCM16 WAV 读取、秒数格式化、SHA-256 和 MP3 导出实现
+- `audio_sound/config.py`、`presets/*.json`：仓库内可编辑固定预设及受控覆盖
+- `audio_sound/presets/*.json`：wheel 内置预设镜像，由测试保证与根目录预设逐字节一致
+
+`final` 主链按证据执行：
+
+1. 从原媒体提取并保持采样率、声道数、声道布局和时长
+2. Respiro/辅助证据驱动的局部呼吸处理
+3. 输入适用时执行保守降噪；清洁源跳过有害整段降噪
+4. 清晰度 EQ、轻去齿音、温和压缩/稳量和响度标准化
+5. 只在确认静音核心执行 `speech_safe_autogate`
+6. 输出逐文件 JSON/Markdown 报告和批次报告
+
+模型存在、可导入、真实执行和可交付是四个不同状态。fallback 或无可量化收益的模型候选必须淘汰。
+
+### 4. 运行时与环境
 
 - `audio_sound/bootstrap.py`
+- `doctor.cmd` / `check_runtime.cmd`
 
-Responsibility:
+运行时层验证 Python 3.10/3.11、FFmpeg、FFprobe、Respiro 权重与依赖以及 DeepFilterNet。最终处理必须使用仓库 `.venv`。
 
-- inspect Python, FFmpeg, FFprobe, Respiro-en runtime prerequisites, and DeepFilterNet availability
-- provide repo-local setup/install commands, including Respiro-en asset bootstrapping
-- emit machine-readable runtime reports
+### 5. 独立发布验证
 
-### 3. Config layer
+- `audio_sound/delivery_verifier.py`
+- `scripts/evaluate_audio_pair.py`
+- `audio_sound/release_audit.py`
 
-Location:
+内部报告 PASS 不是唯一依据。发布验证必须针对实际交付 WAV：
 
-- `audio_sound/config.py`
-- `presets/*.json`
+- 检查报告闭环与 `release_blocked=false`
+- 不使用授权排除窗口，独立比较原音与最终 WAV
+- 检查格式、时长、硬静音、频谱损失/增强和增益稳定
+- 记录 WAV/MP3 SHA-256
 
-Responsibility:
+语音删改任务还必须通过 `audio-audit-release` 的需求—切点—ASR 绑定审计。
 
-- load and validate presets
-- apply runtime overrides without mutating source presets
-- resolve environment and local Python defaults
+## 强制边界
 
-### 4. Pipeline layer
+仓库无法阻止操作者在仓库外手写任意 FFmpeg 命令，因此“墙”由三层共同组成：
 
-Location:
+1. Agent 自动读取的规约和固定入口
+2. 工作流内部 fail-closed 质量守门
+3. CI 与独立 `audio-verify-delivery` 验证
 
-- `audio_sound/pipeline.py`
+绕开权威入口生成的文件，没有绑定报告和独立验证结果时，不得称为仓库最终交付。
 
-Responsibility:
+## 打包与兼容
 
-- discover media files
-- inspect media with FFprobe
-- build deterministic extraction, Respiro-en-first cleanup, denoise, and finalize commands
-- maintain ASCII-stable output layout
-- generate per-file and batch reports
+`audio_sound` 是唯一可安装包。仓库根目录 `scripts/*.py` 只是本地 CLI 薄入口，通过 `sys.path` 调用 `audio_sound`；**不得**再把 `scripts` 注册为顶层 setuptools 包，以免污染用户环境中的通用包名。
 
-Runtime note:
+wheel 内置完整 presets；安装到仓库外的新 venv 后，`audio-cleanup list-presets`、`audio-skill-workflow --dry-run`、`audio-verify-delivery` 与无模型确定性 `final` 链仍可运行。CI 在 Python 3.10/3.11 跑全量测试，并在 Python 3.11 的隔离 wheel 环境执行真实 FFmpeg final smoke、独立 pair guard 与 verify-delivery 冒烟。
 
-- if local Respiro-en repo and weights are configured, the pipeline runs the real detector
-- otherwise it falls back to the local heuristic breath detector so the full cleanup chain remains runnable
+`process_media_file()` 是阶段编排器；停顿清理与呼吸残留闭环分别由 `_run_pause_cleanup()`、`_run_breath_residual_cleanup()` 承担，命令执行统一由 `_run_recorded_command()` 记录和 fail-closed。
 
-### 5. CLI layer
+## 参考输入而非运行时依赖
 
-Location:
-
-- `audio_sound/cli.py`
-- `scripts/audio_cleanup.py`
-
-Responsibility:
-
-- expose `list-presets`, `describe-preset`, `inspect`, `doctor`, `setup`, `clean`, and `process`
-
-## Processing contract
-
-For each input file:
-
-1. extract mono WAV with FFmpeg
-2. detect breath regions via Respiro-en
-3. apply SpectraMini-style breath control and mouth de-click cleanup
-4. run DeepFilterNet on the extracted WAV
-5. run FFmpeg mastering filters on the denoised WAV
-6. export transcript-ready MP3
-7. write JSON and Markdown reports
-
-Default path note:
-
-- the primary path is `Respiro-en -> SpectraMini-style cleanup -> DeepFilterNet -> FFmpeg mastering`
-- older `breath_ducking` and `breath_onset_cleanup` FFmpeg filters remain in the repo only as explicit compatibility mode
-- compatibility is opt-in through CLI/runtime overrides and is not enabled by default presets
-
-## Why this split
-
-This keeps the natural-language surface stable while making the actual processing chain local, inspectable, and testable. It also keeps future upgrades contained: ASR, click-detection heuristics, or additional mastering stages can be added in the pipeline/config layers without changing the user-facing skill contract.
-
-## Reference inputs, not runtime dependencies
-
-The earlier Feishu notes and the `audio-preprocess` repository informed:
-
-- output layout ideas
-- bootstrap expectations
-- a sensible DeepFilterNet + FFmpeg ordering
-
-But `Audio-sound` owns its own runtime contract. It should continue to work even if the reference repository disappears or changes.
+早期 Feishu 笔记和 `audio-preprocess` 仓库只提供设计参考。本仓库拥有自己的运行时与交付契约，即使参考仓库不存在或发生变化，也必须能独立安装、测试和运行。

@@ -2,7 +2,7 @@
 
 `Audio-sound` 是一个面向中文口播、课程讲解、旁白和访谈音频的 Windows 本地音频清理工作流仓库。
 
-它的目标不是做一个轻量预览，而是让 Codex 或人工操作者能直接得到可交付的修音成品：降噪、去呼吸/口水音、处理停顿残留、修复删词接缝，并输出可复核的报告与频谱证据。
+它的目标不是追求绝对安静，而是在自然度、清晰度和稳定性优先的前提下，让 Codex 或人工操作者得到可交付成品，并对已确认的噪声、呼吸、口水音、停顿残留和删词接缝做可复核处理。
 
 
 
@@ -35,11 +35,13 @@
 ## 仓库结构
 
 - `.codex/skills/audio-sound/`：仓库级 Codex skill，记录默认处理规则和验收标准。
-- `audio_sound/`：核心 Python 包，包含配置、流程、删词剪辑和 CLI 逻辑。
+- `audio_sound/`：核心 Python 包，包含配置、流程、共享媒体工具、删词剪辑和 CLI 逻辑。
 - `scripts/audio_cleanup.py`：底层清理、检查、安装和维护入口。
 - `scripts/audio_skill_workflow.py`：推荐的最终成品处理入口。
+- `scripts/evaluate_audio_pair.py`：同源前后对比与质量守门回归工具。
+- `audio-verify-delivery`：将最终 WAV/MP3、核心报告、独立同源对比和 SHA-256 绑定为发布验证清单。
 - `scripts/remove_spoken_segments.py`：物理删词、删句、视频同步剪辑入口。
-- `presets/`：处理预设。
+- `presets/`：可编辑处理预设；wheel 同时内置受测试约束的 `audio_sound/presets/` 镜像。
 - `docs/`：架构、调参和参考说明。
 - `tests/`：单元测试。
 - `release/`：仅用于说明发布包位置；正式压缩包放在 GitHub Releases。
@@ -48,7 +50,7 @@
 
 必需：
 
-- Python 3.10+
+- Python 3.10 或 3.11
 - `ffmpeg`
 - `ffprobe`
 
@@ -101,14 +103,40 @@ python scripts/audio_cleanup.py inspect "D:/audio/raw-voice.wav"
 python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav"
 ```
 
-该流程会：
+默认模式是 `auto`。该流程会：
 
-1. 提取源音频为 WAV。
+1. 提取源音频为 WAV，并保留源采样率与声道布局。
 2. 检查运行环境和可用依赖。
-3. 执行呼吸、口水音、噪声和响度处理。
-4. 输出最终 WAV 和 MP3。
-5. 生成报告、指标和频谱证据。
-6. 将最终成品放入 `output/修音成品/`。
+3. 先建立 `natural` 基线：55 Hz 高通、1.25:1 轻压缩和整体响度统一。
+4. 自动检查底噪、削波、动态范围和可用噪声窗口。
+5. 根据缺陷证据和 `doctor` 能力尝试固定候选，包括安全的 Respiro 呼吸衰减和 DeepFilterNet 降噪；模型不可用时记录 `runtime_unavailable`。
+6. 用格式、吞字、高频清晰度、短时增益、局部相关性、可量化收益和可选双 ASR 守门筛选候选；模型没有实际收益时回退基线。
+7. 输出最终 WAV、MP3、报告、指标和频谱证据。
+8. 将最终成品放入 `output/修音成品/`；守门失败时停止交付并保留报告。
+
+当使用 `final` 处理明确的呼吸音或停顿杂音时，原始 `raw_wav` 不再被原地改写。工作流会融合 Respiro、辅助停顿边缘和噪声型频谱证据，只在语音起点前的授权窗口内按附近底噪自适应处理；母带后继续复检和窄窗口补处理。报告中 `breath_cleanup.status=PASS` 且 `final_residual_windows` 为空才允许交付。preservation 守门仅排除这些有证据的授权窗口，不会放宽其余语音区域。
+
+`final` 也会对确认静音内部的过渡底噪做语音安全 AutoGate 等价清理：两侧保留安全边界（句间约 45 ms，片头/片尾约 25 ms），确认无声核心目标为 `silence_floor_dbfs=-96`，必要时执行多轮窄窗口衰减。该阶段不会启用全局 Dynamics Gate / `agate` 或无证据数字硬静音；`pause_cleanup.status=PASS`、`mode=speech_safe_autogate`、空残留列表和固定刻度局部频谱（中间接近黑色）共同构成交付证据。
+
+只想跑自然基线时：
+
+```bash
+python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --mode natural
+```
+
+同源前后对比：
+
+```bash
+python scripts/evaluate_audio_pair.py --source "D:/audio/raw.wav" --processed "D:/audio/processed.wav" --output "scratch/pair-report.json"
+```
+
+最终交付独立验证：
+
+```powershell
+verify_delivery.cmd --source "D:/audio/raw.wav" --final-wav "output/修音成品/修音版_raw.wav" --final-mp3 "output/修音成品/修音版_raw.mp3" --report "output/<run>/<job>/audio_preprocess/audio_process_report.json" --output "output/<run>/delivery-verification.json"
+```
+
+该命令不使用授权排除窗口。只有验证清单 `status=PASS` 且 `release_blocked=false`，实际交付文件才满足仓库的自动发布门槛。
 
 最终命名规则：
 
@@ -149,10 +177,32 @@ python scripts/remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.6
 
 ## 常用预设
 
+- `natural`：自然基线；关闭自动呼吸衰减、模型降噪、自适应降噪、门限和自动静音。修音意图下只作失败回退，不算完成。
+- `final`：完整修音链；也是 `auto` 主候选 `final_repair_best` 使用的预设。
+- `clarity-leveling-safe`：`auto` 白名单清晰度/稳量候选；无低通、无门限、无硬静音、无模型降噪。
+- `noise-cleanup-safe`：`auto` 白名单保守降噪候选；仅在同文件噪声窗口成立时启用。
+- `respiro-breath-safe`：仅在 Respiro 运行时可用且输入存在呼吸候选证据时生成；只做最大 3 dB 的局部 duck，不做硬静音。
+- `deepfilter-denoise-safe`：仅在稳定底噪、可用噪声窗和适用 SNR 同时成立时生成；关闭 post-filter。
+- `model-combined-review`：仅在两个单模型候选分别通过后生成，并且必须有可绑定的双 ASR 证据才能交付。
 - `fast`：快速一遍处理，动态处理较轻。
-- `safe`：默认中文口播安全预设。
+- `safe`：旧版自动清理预设，需要明确选择。
 - `review`：清理后额外输出可疑静音/残留候选。
 - `voice-isolate`：使用同文件噪声窗口做更有针对性的非人声残留压制。
+
+`reference-legacy` 工作流仅保留用于复现旧版交付和问题对照，不再作为默认成品路径。
+
+## 自适应安全策略
+
+默认 `auto` 以 Best Repair 为目标：先测量源音频，强制竞争 `final_repair_best`，再按证据竞争模型安全候选，而不是对所有文件套同一组强度：
+
+- `baseline`：没有高置信缺陷时，只走自然基线。
+- `leveling_gentle`：语音动态范围偏宽时，只在受限范围内加强轻压缩。
+- `noise_review`：检测到稳定底噪和候选噪声窗口时，只进入复核，不自动开启强降噪。
+- `manual_review`：存在削波等高风险问题时，停止自动加强并要求人工复核。
+
+Codex/GPT 可以读取诊断报告、选择固定白名单候选、输出 `capability_plan` / `repair_scorecard` 并解释原因，但不能直接生成任意 FFmpeg/DSP 参数。Respiro 和 DeepFilterNet 只作为固定安全候选按证据触发；模型候选必须真实执行、禁止 fallback 冒充、通过更严格伤害守门，并且取得可量化收益后才可能胜出。门限、硬静音、强降噪和整段呼吸切除仍禁止自动启用。
+
+格式同样属于发布守门条件：实际处理和 WAV/MP3 交付默认保留源采样率与声道数；双声道只在诊断时临时下混为单声道分析，不会因此把成品转成单声道。声道、采样率、时长、削波、活跃语音衰减或短时增益波动异常时，`quality_guard` 会阻止交付。
 
 示例：
 
@@ -189,7 +239,10 @@ python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --keep-inter
 
 关键规则：
 
-- 默认成品入口是 `python scripts/audio_skill_workflow.py run ...`。
+- 默认成品入口是 `python scripts/audio_skill_workflow.py run ...`，默认模式为 `auto`。
+- 默认保留源采样率、声道数和立体声布局，分析下混不改变交付格式。
+- 自适应控制层只能选择 `baseline`、`leveling_gentle`、`noise_review`、`manual_review` 四个安全档位。
+- `auto` 只能在白名单候选中选择，不得直接生成任意 DSP 参数，也不得绕过质量守门启用破坏性处理。
 - 删词、删句、重复字和接缝问题必须使用 `scripts/remove_spoken_segments.py`。
 - 时间码只是候选，必须结合波形、频谱和局部听感确认边界。
 - ASR 只能辅助定位，不能单独判定“重复字已解决”。
