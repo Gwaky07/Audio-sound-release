@@ -8,10 +8,12 @@ import subprocess
 import tempfile
 import wave
 from array import array
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from .config import PROJECT_ROOT, resolve_binary, resolve_repo_python
@@ -87,6 +89,7 @@ class OutputLayout:
     preprocess_dir: Path
     transcript_dir: Path
     raw_wav: Path
+    breath_wav: Path
     denoised_wav: Path
     noise_sample_wav: Path
     clean_wav: Path
@@ -118,6 +121,79 @@ def build_breath_processing_plan(
             resolved["attenuation_db"] = float(attenuation_db)
         plan.append(resolved)
     return plan
+
+
+SAFE_ADAPTIVE_PROFILES = frozenset(
+    {"baseline", "leveling_gentle", "noise_review", "manual_review"}
+)
+
+
+def select_adaptive_profile(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Select a bounded local processing profile from measured audio facts."""
+    if int(analysis.get("clipped_sample_count", 0)) > 0:
+        return {
+            "profile": "manual_review",
+            "confidence": 0.98,
+            "reason": "Clipped samples were detected; automatic strengthening is unsafe.",
+            "allow_destructive_cleanup": False,
+        }
+    if analysis.get("stationary_noise") and analysis.get("candidate_noise_windows"):
+        return {
+            "profile": "noise_review",
+            "confidence": 0.82,
+            "reason": "A stable noise floor was detected, but automatic denoise remains disabled until a window is reviewed.",
+            "allow_destructive_cleanup": False,
+        }
+    if float(analysis.get("active_dynamic_range_db", 0.0)) > 12.0:
+        return {
+            "profile": "leveling_gentle",
+            "confidence": 0.78,
+            "reason": "Speech dynamics are wide enough for bounded gentle leveling.",
+            "allow_destructive_cleanup": False,
+        }
+    return {
+        "profile": "baseline",
+        "confidence": 0.72,
+        "reason": "No high-confidence defect requires stronger processing.",
+        "allow_destructive_cleanup": False,
+    }
+
+
+def apply_adaptive_profile(preset: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    profile = str(decision.get("profile", "baseline"))
+    if profile not in SAFE_ADAPTIVE_PROFILES:
+        raise ValueError(f"Unsupported adaptive profile: {profile}")
+    resolved = deepcopy(preset)
+    if profile == "leveling_gentle":
+        compressor = resolved.setdefault("filters", {}).setdefault("compressor", {})
+        compressor["enabled"] = True
+        current_threshold = float(compressor.get("threshold_db", -16.0))
+        current_ratio = float(compressor.get("ratio", 1.25))
+        compressor["threshold_db"] = max(-20.0, min(-18.0, current_threshold))
+        compressor["ratio"] = min(1.4, max(1.35, current_ratio))
+    return resolved
+
+
+def apply_input_safety_overrides(
+    preset_name: str,
+    preset: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    resolved = preset
+    adaptations: list[str] = []
+    if (
+        preset_name == "final"
+        and not bool(diagnostics.get("stationary_noise"))
+        and float(diagnostics.get("estimated_snr_db", 0.0) or 0.0) >= 35.0
+    ):
+        resolved = deepcopy(preset)
+        secondary_denoise = resolved.setdefault("filters", {}).setdefault(
+            "secondary_denoise",
+            {},
+        )
+        secondary_denoise["enabled"] = False
+        adaptations.append("skip_secondary_denoise_clean_source")
+    return resolved, adaptations
 
 
 def utc_timestamp_slug() -> str:
@@ -212,7 +288,34 @@ def apply_spectramini_style_cleanup_to_samples(
     attenuation_db: float,
     mouth_declick_sensitivity: float,
     fade_ms: float,
+    channels: int = 1,
 ) -> array:
+    if channels <= 0:
+        raise ValueError("channels must be positive")
+    if channels > 1:
+        channel_samples = [array("h") for _ in range(channels)]
+        for frame_start in range(0, len(samples), channels):
+            for channel_index, value in enumerate(samples[frame_start : frame_start + channels]):
+                channel_samples[channel_index].append(value)
+        cleaned_channels = [
+            apply_spectramini_style_cleanup_to_samples(
+                channel,
+                breath_windows=breath_windows,
+                sample_rate=sample_rate,
+                attenuation_db=attenuation_db,
+                mouth_declick_sensitivity=mouth_declick_sensitivity,
+                fade_ms=fade_ms,
+            )
+            for channel in channel_samples
+        ]
+        cleaned = array("h")
+        frame_count = max((len(channel) for channel in cleaned_channels), default=0)
+        for frame_index in range(frame_count):
+            for channel in cleaned_channels:
+                if frame_index < len(channel):
+                    cleaned.append(channel[frame_index])
+        return cleaned
+
     cleaned = array("h", samples)
     duck_samples_for_windows(
         cleaned,
@@ -222,26 +325,322 @@ def apply_spectramini_style_cleanup_to_samples(
         fade_ms=fade_ms,
     )
 
+    if float(mouth_declick_sensitivity) <= 0.0:
+        return cleaned
+
     if len(cleaned) < 3:
         return cleaned
 
     threshold_scale = max(1.0, 6.0 - (float(mouth_declick_sensitivity) * 4.0))
     diffs = [abs(int(cleaned[index + 1]) - int(cleaned[index])) for index in range(len(cleaned) - 1)]
-    mean_diff = sum(diffs) / float(len(diffs))
-    variance = sum((diff - mean_diff) ** 2 for diff in diffs) / float(len(diffs))
-    std_diff = variance ** 0.5
-    click_threshold = mean_diff + (threshold_scale * std_diff)
+    median_diff = float(median(diffs))
+    median_deviation = float(median(abs(diff - median_diff) for diff in diffs))
+    click_threshold = median_diff + (threshold_scale * max(1.0, median_deviation))
 
     for _ in range(2):
         for index in range(1, len(cleaned) - 1):
             left_delta = abs(int(cleaned[index]) - int(cleaned[index - 1]))
             right_delta = abs(int(cleaned[index + 1]) - int(cleaned[index]))
             sample_peak = abs(int(cleaned[index]))
-            polarity_flip = int(cleaned[index - 1]) * int(cleaned[index]) < 0 or int(cleaned[index]) * int(cleaned[index + 1]) < 0
-            if max(left_delta, right_delta) > click_threshold or sample_peak > click_threshold or polarity_flip:
+            is_impulsive = (
+                sample_peak > click_threshold
+                and min(left_delta, right_delta) > click_threshold
+            )
+            if is_impulsive:
                 cleaned[index] = int((int(cleaned[index - 1]) + int(cleaned[index + 1])) / 2)
 
     return cleaned
+
+
+def _clip_window_before_active_speech(
+    window: NoiseWindow,
+    source_analysis: dict[str, Any],
+) -> NoiseWindow | None:
+    frame_levels = list(source_analysis.get("_frame_rms_db") or [])
+    if not frame_levels:
+        return window
+    frame_seconds = max(0.001, float(source_analysis.get("frame_ms", 10.0)) / 1000.0)
+    speech_level = float(source_analysis.get("speech_level_dbfs", -24.0))
+    # Never let cleanup authorization become less sensitive than the hard-mute
+    # preservation guard. This protects quieter speech onsets that sit below
+    # the representative speech level but are still active source speech.
+    protection_threshold = min(speech_level - 6.0, -35.0)
+    start_index = max(0, int(math.floor(window.start_seconds / frame_seconds)))
+    end_index = min(len(frame_levels), int(math.ceil(window.end_seconds / frame_seconds)))
+    if end_index <= start_index:
+        return None
+
+    leading = start_index
+    while leading < end_index and float(frame_levels[leading]) >= protection_threshold:
+        leading += 1
+    trailing = end_index - 1
+    while trailing >= leading and float(frame_levels[trailing]) >= protection_threshold:
+        trailing -= 1
+    if trailing < leading:
+        return None
+
+    first_internal_active = next(
+        (
+            index
+            for index in range(leading, trailing + 1)
+            if float(frame_levels[index]) >= protection_threshold
+        ),
+        None,
+    )
+    if first_internal_active is not None:
+        trailing = first_internal_active - 1
+    if trailing < leading:
+        return None
+
+    safe_start = max(window.start_seconds, leading * frame_seconds)
+    safe_end = min(window.end_seconds, (trailing + 1) * frame_seconds)
+    if safe_end - safe_start < 0.04:
+        return None
+    return NoiseWindow(round(safe_start, 6), round(safe_end, 6))
+
+
+def build_effective_breath_windows(
+    *,
+    respiro_windows: list[NoiseWindow],
+    auxiliary_windows: list[NoiseWindow],
+    source_analysis: dict[str, Any],
+    max_gap_seconds: float = 0.008,
+) -> tuple[list[NoiseWindow], list[dict[str, Any]]]:
+    tagged = [
+        (window, "respiro") for window in respiro_windows
+    ] + [
+        (window, "auxiliary") for window in auxiliary_windows
+    ]
+    tagged.sort(key=lambda item: (item[0].start_seconds, item[0].end_seconds))
+    safe_tagged: list[tuple[NoiseWindow, str]] = []
+    rejected: list[tuple[NoiseWindow, str]] = []
+    for window, source in tagged:
+        safe_window = _clip_window_before_active_speech(window, source_analysis)
+        if safe_window is None:
+            rejected.append((window, source))
+        else:
+            safe_tagged.append((safe_window, source))
+    tagged = safe_tagged
+    groups: list[tuple[NoiseWindow, set[str]]] = []
+    for window, source in tagged:
+        if window.end_seconds <= window.start_seconds:
+            continue
+        if groups and window.start_seconds <= groups[-1][0].end_seconds + max_gap_seconds:
+            previous, sources = groups[-1]
+            groups[-1] = (
+                NoiseWindow(
+                    start_seconds=min(previous.start_seconds, window.start_seconds),
+                    end_seconds=max(previous.end_seconds, window.end_seconds),
+                ),
+                {*sources, source},
+            )
+        else:
+            groups.append((window, {source}))
+
+    accepted: list[NoiseWindow] = []
+    evidence: list[dict[str, Any]] = [
+        {
+            "start_seconds": round(window.start_seconds, 6),
+            "end_seconds": round(window.end_seconds, 6),
+            "sources": [source],
+            "evidence_grade": "single_source_review",
+            "decision": "rejected_active_speech",
+        }
+        for window, source in rejected
+    ]
+    for window, sources in groups:
+        evidence.append(
+            {
+                "start_seconds": round(window.start_seconds, 6),
+                "end_seconds": round(window.end_seconds, 6),
+                "sources": sorted(sources, key=("respiro", "auxiliary").index),
+                "evidence_grade": (
+                    "model_aux_confirmed"
+                    if sources == {"respiro", "auxiliary"}
+                    else "single_source_confirmed"
+                ),
+                "decision": "accepted",
+            }
+        )
+        accepted.append(window)
+    evidence.sort(key=lambda item: (item["start_seconds"], item["end_seconds"]))
+    return accepted, evidence
+
+
+def filter_noise_like_breath_windows(
+    samples: array,
+    *,
+    windows: list[NoiseWindow],
+    sample_rate: int,
+    channels: int,
+    minimum_zero_crossing_rate: float = 0.04,
+    minimum_roughness_ratio: float = 0.45,
+) -> tuple[list[NoiseWindow], list[dict[str, Any]]]:
+    accepted: list[NoiseWindow] = []
+    evidence: list[dict[str, Any]] = []
+    for window in windows:
+        interleaved = _window_samples(
+            samples,
+            window,
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+        mono = array("h")
+        for frame_start in range(0, len(interleaved), channels):
+            frame = interleaved[frame_start : frame_start + channels]
+            if frame:
+                mono.append(int(sum(int(value) for value in frame) / len(frame)))
+        rms = _compute_rms(mono)
+        differences = array(
+            "h",
+            [
+                max(-32768, min(32767, int(mono[index]) - int(mono[index - 1])))
+                for index in range(1, len(mono))
+            ],
+        )
+        roughness_ratio = _compute_rms(differences) / max(1.0, rms)
+        zero_crossings = sum(
+            1
+            for index in range(1, len(mono))
+            if (int(mono[index - 1]) < 0 <= int(mono[index]))
+            or (int(mono[index - 1]) >= 0 > int(mono[index]))
+        )
+        zero_crossing_rate = zero_crossings / max(1, len(mono) - 1)
+        is_noise_like = (
+            zero_crossing_rate >= minimum_zero_crossing_rate
+            and roughness_ratio >= minimum_roughness_ratio
+        )
+        evidence.append(
+            {
+                "start_seconds": round(window.start_seconds, 6),
+                "end_seconds": round(window.end_seconds, 6),
+                "zero_crossing_rate": round(zero_crossing_rate, 4),
+                "roughness_ratio": round(roughness_ratio, 4),
+                "decision": (
+                    "accepted_noise_like"
+                    if is_noise_like
+                    else "rejected_harmonic_content"
+                ),
+            }
+        )
+        if is_noise_like:
+            accepted.append(window)
+    return accepted, evidence
+
+
+def _window_samples(
+    samples: array,
+    window: NoiseWindow,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> array:
+    start_frame = max(0, int(window.start_seconds * sample_rate))
+    end_frame = max(start_frame, int(window.end_seconds * sample_rate))
+    return samples[start_frame * channels : min(len(samples), end_frame * channels)]
+
+
+def apply_adaptive_breath_cleanup(
+    samples: array,
+    *,
+    windows: list[NoiseWindow],
+    sample_rate: int,
+    channels: int,
+    max_attenuation_db: float,
+    target_margin_db: float,
+    context_ms: float,
+    fade_ms: float,
+    target_dbfs_override: float | None = None,
+) -> tuple[array, list[dict[str, Any]]]:
+    cleaned = array("h", samples)
+    details: list[dict[str, Any]] = []
+    context_seconds = max(0.0, context_ms / 1000.0)
+    for window in merge_noise_windows(windows, max_gap_seconds=0.008):
+        window_samples = _window_samples(
+            samples,
+            window,
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+        context_window = NoiseWindow(
+            max(0.0, window.start_seconds - context_seconds),
+            window.start_seconds,
+        )
+        context_samples = _window_samples(
+            samples,
+            context_window,
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+        if not context_samples:
+            context_samples = _window_samples(
+                samples,
+                NoiseWindow(window.end_seconds, window.end_seconds + context_seconds),
+                sample_rate=sample_rate,
+                channels=channels,
+            )
+        window_dbfs = _amplitude_to_dbfs(_compute_rms(window_samples))
+        context_dbfs = _amplitude_to_dbfs(_compute_rms(context_samples))
+        target_dbfs = (
+            float(target_dbfs_override)
+            if target_dbfs_override is not None
+            else context_dbfs + float(target_margin_db)
+        )
+        requested_db = max(
+            0.0,
+            min(float(max_attenuation_db), window_dbfs - target_dbfs),
+        )
+        if requested_db > 0.0:
+            duck_samples_for_windows(
+                cleaned,
+                sample_rate=sample_rate,
+                windows=[window],
+                floor_gain=attenuation_db_to_gain(requested_db),
+                fade_ms=fade_ms,
+                channels=channels,
+            )
+        details.append(
+            {
+                "start_seconds": round(window.start_seconds, 6),
+                "end_seconds": round(window.end_seconds, 6),
+                "window_dbfs": round(window_dbfs, 3),
+                "context_dbfs": round(context_dbfs, 3),
+                "target_dbfs": round(target_dbfs, 3),
+                "requested_attenuation_db": round(requested_db, 3),
+            }
+        )
+    return cleaned, details
+
+
+def match_residual_breath_windows(
+    *,
+    parent_windows: list[NoiseWindow],
+    residual_windows: list[NoiseWindow],
+    min_duration_seconds: float = 0.03,
+) -> list[NoiseWindow]:
+    matched: list[NoiseWindow] = []
+    for parent in parent_windows:
+        for residual in residual_windows:
+            start = max(parent.start_seconds, residual.start_seconds)
+            end = min(parent.end_seconds, residual.end_seconds)
+            if end - start >= min_duration_seconds:
+                matched.append(NoiseWindow(start, end))
+    return merge_noise_windows(matched, max_gap_seconds=0.008)
+
+
+def trim_noise_windows_for_assessment(
+    windows: list[NoiseWindow],
+    *,
+    edge_seconds: float,
+    minimum_duration_seconds: float = 0.02,
+) -> list[NoiseWindow]:
+    trimmed: list[NoiseWindow] = []
+    for window in windows:
+        start = window.start_seconds + max(0.0, edge_seconds)
+        end = window.end_seconds - max(0.0, edge_seconds)
+        if end - start >= minimum_duration_seconds:
+            trimmed.append(NoiseWindow(start, end))
+    return trimmed
 
 
 def run_respiro_or_fallback_detection(
@@ -569,6 +968,7 @@ def build_output_layout(*, input_path: Path, output_root: Path, run_slug: str) -
         preprocess_dir=preprocess_dir,
         transcript_dir=transcript_dir,
         raw_wav=preprocess_dir / f"{file_base_name}_raw.wav",
+        breath_wav=preprocess_dir / f"{file_base_name}_breath.wav",
         denoised_wav=preprocess_dir / f"{file_base_name}_df.wav",
         noise_sample_wav=preprocess_dir / f"{file_base_name}_noise_sample.wav",
         clean_wav=preprocess_dir / f"{file_base_name}_clean.wav",
@@ -579,8 +979,34 @@ def build_output_layout(*, input_path: Path, output_root: Path, run_slug: str) -
     )
 
 
-def build_ffmpeg_extract_command(*, input_path: Path, raw_wav: Path, preset: dict[str, Any], ffmpeg_bin: str) -> list[str]:
+def resolve_processing_format(
+    source_metadata: dict[str, Any] | None,
+    preset: dict[str, Any],
+) -> dict[str, int | str]:
     extract = preset["extract"]
+    source_sample_rate = (source_metadata or {}).get("sample_rate")
+    source_channels = (source_metadata or {}).get("channels")
+    sample_rate = int(source_sample_rate) if source_sample_rate else int(extract["sample_rate"])
+    channels = int(source_channels) if source_channels else int(extract["channels"])
+    if sample_rate <= 0 or channels <= 0:
+        raise ValueError("source audio format must contain positive sample_rate and channels")
+    return {
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "pcm_codec": str(extract["pcm_codec"]),
+    }
+
+
+def build_ffmpeg_extract_command(
+    *,
+    input_path: Path,
+    raw_wav: Path,
+    preset: dict[str, Any],
+    ffmpeg_bin: str,
+    processing_format: dict[str, int | str] | None = None,
+) -> list[str]:
+    extract = preset["extract"]
+    output_format = processing_format or resolve_processing_format(None, preset)
     return [
         ffmpeg_bin,
         "-y",
@@ -590,11 +1016,11 @@ def build_ffmpeg_extract_command(*, input_path: Path, raw_wav: Path, preset: dic
         str(input_path),
         "-vn",
         "-ac",
-        str(extract["channels"]),
+        str(output_format["channels"]),
         "-ar",
-        str(extract["sample_rate"]),
+        str(output_format["sample_rate"]),
         "-c:a",
-        extract["pcm_codec"],
+        str(output_format.get("pcm_codec", extract["pcm_codec"])),
         str(raw_wav),
     ]
 
@@ -642,6 +1068,7 @@ def build_ffmpeg_noise_sample_command(
     noise_windows: list[NoiseWindow],
     preset: dict[str, Any],
     ffmpeg_bin: str,
+    processing_format: dict[str, int | str] | None = None,
 ) -> list[str]:
     if not noise_windows:
         raise ValueError("At least one noise window is required to build a noise sample command")
@@ -660,6 +1087,7 @@ def build_ffmpeg_noise_sample_command(
 
     segments.append(f"{''.join(concat_inputs)}concat=n={len(noise_windows)}:v=0:a=1[outa]")
     filter_complex = ";".join(segments)
+    output_format = processing_format or resolve_processing_format(None, preset)
     return [
         ffmpeg_bin,
         "-y",
@@ -672,11 +1100,11 @@ def build_ffmpeg_noise_sample_command(
         "-map",
         "[outa]",
         "-ar",
-        str(preset["extract"]["sample_rate"]),
+        str(output_format["sample_rate"]),
         "-ac",
-        str(preset["extract"]["channels"]),
+        str(output_format["channels"]),
         "-c:a",
-        preset["extract"]["pcm_codec"],
+        str(output_format.get("pcm_codec", preset["extract"]["pcm_codec"])),
         str(noise_sample_wav),
     ]
 
@@ -705,6 +1133,17 @@ def build_mastering_filter_chain(
     lowpass_hz = filters.get("lowpass_hz")
     if include_tonal_shaping and lowpass_hz:
         parts.append(f"lowpass=f={lowpass_hz}")
+
+    equalizer = filters.get("equalizer", {})
+    if include_tonal_shaping and equalizer.get("enabled"):
+        for band in equalizer.get("bands", []):
+            parts.append(
+                "equalizer="
+                f"f={band['frequency_hz']}:"
+                f"t={band.get('width_type', 'q')}:"
+                f"w={band.get('width', 1.0)}:"
+                f"g={band['gain_db']}"
+            )
 
     declick = filters.get("declick", {})
     if include_declick and declick.get("enabled"):
@@ -880,8 +1319,10 @@ def build_ffmpeg_finalize_commands(
     ffmpeg_bin: str,
     noise_sample_wav: Path | None = None,
     noise_sample_duration: float | None = None,
+    processing_format: dict[str, int | str] | None = None,
 ) -> list[list[str]]:
     transcript = preset["transcript_export"]
+    output_format = processing_format or resolve_processing_format(None, preset)
     breath_ducking_enabled = preset.get("filters", {}).get("breath_ducking", {}).get("enabled", False)
     if noise_sample_wav is not None:
         if noise_sample_duration is None or noise_sample_duration <= 0:
@@ -940,11 +1381,11 @@ def build_ffmpeg_finalize_commands(
             "-map",
             "[outa]",
             "-ar",
-            str(preset["extract"]["sample_rate"]),
+            str(output_format["sample_rate"]),
             "-ac",
-            str(preset["extract"]["channels"]),
+            str(output_format["channels"]),
             "-c:a",
-            preset["extract"]["pcm_codec"],
+            str(output_format.get("pcm_codec", preset["extract"]["pcm_codec"])),
             str(clean_wav),
         ]
     elif breath_ducking_enabled:
@@ -966,11 +1407,11 @@ def build_ffmpeg_finalize_commands(
             "-map",
             "[outa]",
             "-ar",
-            str(preset["extract"]["sample_rate"]),
+            str(output_format["sample_rate"]),
             "-ac",
-            str(preset["extract"]["channels"]),
+            str(output_format["channels"]),
             "-c:a",
-            preset["extract"]["pcm_codec"],
+            str(output_format.get("pcm_codec", preset["extract"]["pcm_codec"])),
             str(clean_wav),
         ]
     else:
@@ -984,11 +1425,11 @@ def build_ffmpeg_finalize_commands(
             "-af",
             build_mastering_filter_chain(preset),
             "-ar",
-            str(preset["extract"]["sample_rate"]),
+            str(output_format["sample_rate"]),
             "-ac",
-            str(preset["extract"]["channels"]),
+            str(output_format["channels"]),
             "-c:a",
-            preset["extract"]["pcm_codec"],
+            str(output_format.get("pcm_codec", preset["extract"]["pcm_codec"])),
             str(clean_wav),
         ]
 
@@ -1245,11 +1686,12 @@ def detect_breath_onset_windows(
 
     with wave.open(str(audio_path), "rb") as reader:
         params = reader.getparams()
-        if params.sampwidth != 2 or params.nchannels != 1:
-            raise ValueError("Breath onset detection currently expects mono 16-bit WAV audio")
+        if params.sampwidth != 2 or params.nchannels <= 0:
+            raise ValueError("Breath onset detection expects 16-bit WAV audio")
         raw_frames = reader.readframes(params.nframes)
     samples = array("h")
     samples.frombytes(raw_frames)
+    samples = _analysis_samples(params, samples)
 
     inferred_windows = infer_breath_windows_from_silence_edges(
         samples,
@@ -1267,27 +1709,33 @@ def duck_samples_for_windows(
     windows: list[NoiseWindow],
     floor_gain: float,
     fade_ms: float,
+    channels: int = 1,
 ) -> None:
+    if channels <= 0:
+        raise ValueError("channels must be positive")
     merged_windows = merge_noise_windows(windows)
-    fade_samples = max(0, int(sample_rate * (fade_ms / 1000.0)))
-    total_samples = len(samples)
+    fade_frames = max(0, int(sample_rate * (fade_ms / 1000.0)))
+    total_frames = len(samples) // channels
 
     for window in merged_windows:
-        start_index = max(0, min(total_samples, int(window.start_seconds * sample_rate)))
-        end_index = max(start_index, min(total_samples, int(window.end_seconds * sample_rate)))
-        if end_index <= start_index:
+        start_frame = max(0, min(total_frames, int(window.start_seconds * sample_rate)))
+        end_frame = max(start_frame, min(total_frames, int(window.end_seconds * sample_rate)))
+        if end_frame <= start_frame:
             continue
 
-        local_fade = min(fade_samples, max(0, (end_index - start_index) // 2))
-        for index in range(start_index, end_index):
+        local_fade = min(fade_frames, max(0, (end_frame - start_frame) // 2))
+        for frame_index in range(start_frame, end_frame):
             gain = floor_gain
-            if local_fade > 0 and index < start_index + local_fade:
-                progress = (index - start_index) / float(local_fade)
+            if local_fade > 0 and frame_index < start_frame + local_fade:
+                progress = (frame_index - start_frame) / float(local_fade)
                 gain = 1.0 - (1.0 - floor_gain) * progress
-            elif local_fade > 0 and index >= end_index - local_fade:
-                progress = (index - (end_index - local_fade)) / float(local_fade)
+            elif local_fade > 0 and frame_index >= end_frame - local_fade:
+                progress = (frame_index - (end_frame - local_fade)) / float(local_fade)
                 gain = floor_gain + (1.0 - floor_gain) * progress
-            samples[index] = int(samples[index] * gain)
+            frame_start = frame_index * channels
+            for channel_index in range(channels):
+                sample_index = frame_start + channel_index
+                samples[sample_index] = int(samples[sample_index] * gain)
 
 
 def duck_audio_file_in_place(
@@ -1303,8 +1751,8 @@ def duck_audio_file_in_place(
 
     with wave.open(str(audio_path), "rb") as reader:
         params = reader.getparams()
-        if params.sampwidth != 2 or params.nchannels != 1:
-            raise ValueError("Breath ducking currently expects mono 16-bit WAV audio")
+        if params.sampwidth != 2 or params.nchannels <= 0:
+            raise ValueError("Breath ducking expects 16-bit WAV audio")
         raw_frames = reader.readframes(params.nframes)
 
     samples = array("h")
@@ -1315,6 +1763,7 @@ def duck_audio_file_in_place(
         windows=merged_windows,
         floor_gain=floor_gain,
         fade_ms=fade_ms,
+        channels=params.nchannels,
     )
 
     temp_path = audio_path.with_name(f"{audio_path.stem}.breathduck.tmp.wav")
@@ -1328,6 +1777,540 @@ def _amplitude_to_dbfs(amplitude: float) -> float:
     if amplitude <= 0:
         return -120.0
     return 20.0 * math.log10(amplitude / 32767.0)
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return -120.0
+    ordered = sorted(values)
+    position = max(0.0, min(1.0, fraction)) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] + ((ordered[upper] - ordered[lower]) * weight)
+
+
+def analyze_pcm16_samples(
+    samples: array,
+    *,
+    sample_rate: int,
+    frame_ms: float = 20.0,
+) -> dict[str, Any]:
+    frame_size = max(1, int(sample_rate * (frame_ms / 1000.0)))
+    frame_levels: list[float] = []
+    frame_peaks: list[float] = []
+    clipped_sample_count = 0
+    total_energy = 0.0
+    total_peak = 0
+
+    for start in range(0, len(samples), frame_size):
+        frame = samples[start : start + frame_size]
+        if not frame:
+            continue
+        peak = max(abs(int(value)) for value in frame)
+        energy = sum(float(int(value) * int(value)) for value in frame)
+        frame_levels.append(_amplitude_to_dbfs(math.sqrt(energy / len(frame))))
+        frame_peaks.append(_amplitude_to_dbfs(float(peak)))
+        clipped_sample_count += sum(1 for value in frame if abs(int(value)) >= 32767)
+        total_energy += energy
+        total_peak = max(total_peak, peak)
+
+    if not frame_levels:
+        frame_levels = [-120.0]
+        frame_peaks = [-120.0]
+
+    low_level_cutoff_dbfs = _percentile(frame_levels, 0.2)
+    low_levels = [level for level in frame_levels if level <= low_level_cutoff_dbfs]
+    finite_low_levels = [level for level in low_levels if level > -90.0]
+    noise_floor_source = finite_low_levels or low_levels
+    noise_floor_dbfs = median(noise_floor_source) if noise_floor_source else -120.0
+    speech_level_dbfs = _percentile(frame_levels, 0.8)
+    speech_activity_threshold_dbfs = max(
+        -50.0,
+        speech_level_dbfs - 30.0,
+    )
+    active_levels = [level for level in frame_levels if level >= speech_activity_threshold_dbfs]
+    noise_variation_db = _percentile(noise_floor_source, 0.9) - _percentile(noise_floor_source, 0.1)
+    pause_threshold_dbfs = min(-25.0, speech_level_dbfs - 10.0)
+    pause_ratio = sum(level <= pause_threshold_dbfs for level in frame_levels) / len(frame_levels)
+    estimated_snr_db = speech_level_dbfs - noise_floor_dbfs
+    active_dynamic_range_db = (
+        _percentile(active_levels, 0.9) - _percentile(active_levels, 0.1)
+        if active_levels
+        else 0.0
+    )
+    stationary_noise = (
+        -55.0 < noise_floor_dbfs < -25.0
+        and noise_variation_db <= 4.0
+        and pause_ratio >= 0.05
+        and estimated_snr_db >= 8.0
+    )
+
+    candidate_threshold_dbfs = min(
+        -25.0,
+        noise_floor_dbfs + 3.0,
+        speech_level_dbfs - 10.0,
+    )
+    candidate_windows: list[dict[str, float]] = []
+    candidate_start: int | None = None
+    for index, level in enumerate(frame_levels + [0.0]):
+        is_candidate = index < len(frame_levels) and level <= candidate_threshold_dbfs
+        if is_candidate and candidate_start is None:
+            candidate_start = index
+        if not is_candidate and candidate_start is not None:
+            duration_seconds = (index - candidate_start) * frame_size / float(sample_rate)
+            if duration_seconds >= 0.5:
+                candidate_windows.append(
+                    {
+                        "start_seconds": round(candidate_start * frame_size / float(sample_rate), 3),
+                        "end_seconds": round(index * frame_size / float(sample_rate), 3),
+                        "duration_seconds": round(duration_seconds, 3),
+                    }
+                )
+            candidate_start = None
+    candidate_windows = sorted(
+        candidate_windows,
+        key=lambda item: item["duration_seconds"],
+        reverse=True,
+    )[:3]
+
+    recommendations: list[dict[str, Any]] = []
+    if clipped_sample_count:
+        recommendations.append(
+            {
+                "action": "manual_clipping_review",
+                "priority": "high",
+                "reason": "Source contains clipped samples; do not hide this with stronger denoise or gating.",
+            }
+        )
+    if stationary_noise and candidate_windows:
+        recommendations.append(
+            {
+                "action": "noise_window_candidate",
+                "priority": "medium",
+                "reason": "A stable low-level noise floor and usable pauses were detected.",
+                "windows": candidate_windows,
+            }
+        )
+    if active_dynamic_range_db > 12.0:
+        recommendations.append(
+            {
+                "action": "gentle_leveling_review",
+                "priority": "medium",
+                "reason": "Active speech has a wide short-term level spread; keep leveling gentle and compare against the natural baseline.",
+            }
+        )
+    if not recommendations:
+        recommendations.append(
+            {
+                "action": "natural_baseline_only",
+                "priority": "low",
+                "reason": "No high-confidence reason was found to enable destructive cleanup automatically.",
+            }
+        )
+
+    return {
+        "frame_ms": frame_ms,
+        "frame_count": len(frame_levels),
+        "duration_seconds": round(len(samples) / float(sample_rate), 3) if sample_rate else 0.0,
+        "rms_dbfs": _amplitude_to_dbfs(math.sqrt(total_energy / len(samples))) if samples else -120.0,
+        "peak_dbfs": _amplitude_to_dbfs(float(total_peak)),
+        "clipped_sample_count": clipped_sample_count,
+        "clipped_sample_ratio": round(clipped_sample_count / float(len(samples)), 8) if samples else 0.0,
+        "noise_floor_dbfs": round(noise_floor_dbfs, 2),
+        "speech_level_dbfs": round(speech_level_dbfs, 2),
+        "estimated_snr_db": round(estimated_snr_db, 2),
+        "speech_activity_threshold_dbfs": round(speech_activity_threshold_dbfs, 2),
+        "pause_ratio": round(pause_ratio, 4),
+        "active_dynamic_range_db": round(active_dynamic_range_db, 2),
+        "noise_variation_db": round(noise_variation_db, 2),
+        "stationary_noise": stationary_noise,
+        "candidate_noise_windows": candidate_windows,
+        "recommendations": recommendations,
+        "_frame_rms_db": frame_levels,
+    }
+
+
+def compare_audio_preservation(
+    reference_analysis: dict[str, Any],
+    processed_analysis: dict[str, Any],
+    *,
+    reference_format: dict[str, Any] | None = None,
+    processed_format: dict[str, Any] | None = None,
+    reference_samples: array | None = None,
+    processed_samples: array | None = None,
+    sample_rate: int | None = None,
+    excluded_windows: list[NoiseWindow] | None = None,
+) -> dict[str, Any]:
+    reference_frames = reference_analysis.get("_frame_rms_db", [])
+    processed_frames = processed_analysis.get("_frame_rms_db", [])
+    active_threshold = float(reference_analysis.get("speech_activity_threshold_dbfs", -50.0))
+    frame_ms = float(reference_analysis.get("frame_ms", 20.0))
+    max_lag_frames = max(1, int(round(20.0 / max(frame_ms, 1.0))))
+    alignment_frames = _best_frame_level_alignment(
+        reference_frames,
+        processed_frames,
+        active_threshold=active_threshold,
+        max_lag_frames=max_lag_frames,
+    )
+    resolved_excluded_windows = merge_noise_windows(excluded_windows or [])
+
+    def frame_is_excluded(frame_index: int) -> bool:
+        frame_start = frame_index * frame_ms / 1000.0
+        frame_end = frame_start + frame_ms / 1000.0
+        return any(
+            frame_start < window.end_seconds
+            and frame_end > window.start_seconds
+            for window in resolved_excluded_windows
+        )
+
+    aligned_pairs = [
+        (reference_frames[index], processed_frames[index + alignment_frames])
+        for index in range(len(reference_frames))
+        if 0 <= index + alignment_frames < len(processed_frames)
+        and reference_frames[index] >= active_threshold
+        and not frame_is_excluded(index)
+    ]
+    deltas = [
+        processed_level - reference_level
+        for reference_level, processed_level in aligned_pairs
+    ]
+    median_gain_db = median(deltas) if deltas else 0.0
+    relative_deltas = [delta - median_gain_db for delta in deltas]
+    worst_relative_attenuation_db = _percentile(relative_deltas, 0.05) if relative_deltas else 0.0
+    relative_gain_spread_db = (
+        _percentile(relative_deltas, 0.95) - _percentile(relative_deltas, 0.05)
+        if relative_deltas
+        else 0.0
+    )
+    active_level_correlation = 1.0
+    if len(aligned_pairs) >= 3:
+        reference_mean = sum(pair[0] for pair in aligned_pairs) / len(aligned_pairs)
+        processed_mean = sum(pair[1] for pair in aligned_pairs) / len(aligned_pairs)
+        covariance = sum(
+            (reference - reference_mean) * (processed - processed_mean)
+            for reference, processed in aligned_pairs
+        )
+        reference_energy = sum(
+            (reference - reference_mean) ** 2 for reference, _ in aligned_pairs
+        )
+        processed_energy = sum(
+            (processed - processed_mean) ** 2 for _, processed in aligned_pairs
+        )
+        denominator = math.sqrt(reference_energy * processed_energy)
+        if denominator > 1e-12:
+            active_level_correlation = max(-1.0, min(1.0, covariance / denominator))
+    failures: list[str] = []
+    thresholds = {
+        "worst_relative_attenuation_db": -6.0,
+        "relative_gain_spread_db": 10.0,
+        "hard_mute_source_dbfs": -35.0,
+        "hard_mute_output_dbfs": -90.0,
+        "hard_mute_min_duration_ms": 20.0,
+        "spectral_max_loss_db_2_8k": 3.0,
+        "spectral_max_loss_db_8_12k": 4.0,
+        "spectral_max_gain_db_2_12k": 3.0,
+        "spectral_max_gain_db_12_16k": 3.0,
+    }
+    reference_format = reference_format or {}
+    processed_format = processed_format or {}
+    sample_rate_preserved: bool | None = None
+    channel_layout_preserved: bool | None = None
+    if reference_format.get("sample_rate") and processed_format.get("sample_rate"):
+        sample_rate_preserved = int(reference_format["sample_rate"]) == int(processed_format["sample_rate"])
+        if not sample_rate_preserved:
+            failures.append("sample_rate_changed")
+    if reference_format.get("channels") and processed_format.get("channels"):
+        channel_layout_preserved = int(reference_format["channels"]) == int(processed_format["channels"])
+        if not channel_layout_preserved:
+            failures.append("channel_layout_changed")
+    if abs(float(reference_analysis.get("duration_seconds", 0.0)) - float(processed_analysis.get("duration_seconds", 0.0))) > 0.001:
+        failures.append("duration_changed")
+    if int(processed_analysis.get("clipped_sample_count", 0)) > int(reference_analysis.get("clipped_sample_count", 0)):
+        failures.append("clipping_increased")
+    if relative_deltas and worst_relative_attenuation_db < thresholds["worst_relative_attenuation_db"]:
+        failures.append("active_speech_attenuated")
+    if relative_deltas and relative_gain_spread_db > thresholds["relative_gain_spread_db"]:
+        failures.append("short_term_gain_instability")
+
+    hard_mute_windows: list[dict[str, Any]] = []
+    spectral_band_deltas_db: dict[str, float] = {}
+    if (
+        reference_samples is not None
+        and processed_samples is not None
+        and sample_rate is not None
+        and sample_rate > 0
+    ):
+        comparison_processed_samples = array("h", processed_samples)
+        for window in resolved_excluded_windows:
+            start_index = max(0, int(window.start_seconds * sample_rate))
+            end_index = min(
+                len(comparison_processed_samples),
+                int(math.ceil(window.end_seconds * sample_rate)),
+            )
+            comparison_processed_samples[start_index:end_index] = (
+                reference_samples[start_index:end_index]
+            )
+        hard_mute_windows = detect_source_active_hard_mute_windows(
+            reference_samples,
+            comparison_processed_samples,
+            sample_rate=sample_rate,
+            alignment_frames=alignment_frames,
+            frame_ms=frame_ms,
+            source_threshold_dbfs=thresholds["hard_mute_source_dbfs"],
+            output_threshold_dbfs=thresholds["hard_mute_output_dbfs"],
+            min_duration_ms=thresholds["hard_mute_min_duration_ms"],
+        )
+        if hard_mute_windows:
+            failures.append("source_active_hard_mute")
+        spectral_band_deltas_db = measure_spectral_band_deltas_db(
+            reference_samples,
+            comparison_processed_samples,
+            sample_rate=sample_rate,
+            median_gain_db=median_gain_db,
+        )
+        for band_name, delta_db in spectral_band_deltas_db.items():
+            if band_name in {"2-4k", "4-6k", "6-8k"} and delta_db < -thresholds["spectral_max_loss_db_2_8k"]:
+                failures.append("spectral_clarity_lost")
+                break
+            if band_name in {"8-10k", "10-12k", "12-16k"} and delta_db < -thresholds["spectral_max_loss_db_8_12k"]:
+                failures.append("spectral_clarity_lost")
+                break
+        for band_name, delta_db in spectral_band_deltas_db.items():
+            if band_name in {"2-4k", "4-6k", "6-8k", "8-10k", "10-12k"} and delta_db > thresholds["spectral_max_gain_db_2_12k"]:
+                failures.append("spectral_harshness_increased")
+                break
+            if band_name == "12-16k" and delta_db > thresholds["spectral_max_gain_db_12_16k"]:
+                failures.append("spectral_harshness_increased")
+                break
+
+    failures = list(dict.fromkeys(failures))
+    return {
+        "evidence_level": "DIRECTLY VERIFIED",
+        "status": "FAIL" if failures else "PASS",
+        "checked_active_frames": len(deltas),
+        "alignment_frames": alignment_frames,
+        "alignment_ms": round(alignment_frames * frame_ms, 3),
+        "median_gain_db": round(median_gain_db, 2),
+        "worst_relative_attenuation_db": round(worst_relative_attenuation_db, 2),
+        "relative_gain_spread_db": round(relative_gain_spread_db, 2),
+        "active_level_correlation": round(active_level_correlation, 4),
+        "excluded_window_count": len(resolved_excluded_windows),
+        "thresholds": thresholds,
+        "hard_mute_windows": hard_mute_windows,
+        "spectral_band_deltas_db": spectral_band_deltas_db,
+        "failures": failures,
+        "release_blocked": bool(failures),
+        "reference_format": reference_format,
+        "processed_format": processed_format,
+        "sample_rate_preserved": sample_rate_preserved,
+        "channel_layout_preserved": channel_layout_preserved,
+    }
+
+
+def detect_source_active_hard_mute_windows(
+    reference_samples: array,
+    processed_samples: array,
+    *,
+    sample_rate: int,
+    alignment_frames: int = 0,
+    frame_ms: float = 10.0,
+    source_threshold_dbfs: float = -35.0,
+    output_threshold_dbfs: float = -90.0,
+    min_duration_ms: float = 20.0,
+) -> list[dict[str, Any]]:
+    frame_size = max(1, int(sample_rate * (frame_ms / 1000.0)))
+    reference_frames = [
+        _amplitude_to_dbfs(
+            math.sqrt(
+                sum(float(int(value) * int(value)) for value in reference_samples[start : start + frame_size])
+                / max(1, len(reference_samples[start : start + frame_size]))
+            )
+        )
+        for start in range(0, len(reference_samples), frame_size)
+        if reference_samples[start : start + frame_size]
+    ]
+    processed_frames = [
+        _amplitude_to_dbfs(
+            math.sqrt(
+                sum(float(int(value) * int(value)) for value in processed_samples[start : start + frame_size])
+                / max(1, len(processed_samples[start : start + frame_size]))
+            )
+        )
+        for start in range(0, len(processed_samples), frame_size)
+        if processed_samples[start : start + frame_size]
+    ]
+    mask: list[bool] = []
+    for index, reference_level in enumerate(reference_frames):
+        processed_index = index + alignment_frames
+        if processed_index < 0 or processed_index >= len(processed_frames):
+            mask.append(False)
+            continue
+        mask.append(
+            reference_level >= source_threshold_dbfs
+            and processed_frames[processed_index] <= output_threshold_dbfs
+        )
+    windows: list[dict[str, Any]] = []
+    start_index: int | None = None
+    for index, is_hard_mute in enumerate(mask + [False]):
+        if is_hard_mute and start_index is None:
+            start_index = index
+        elif not is_hard_mute and start_index is not None:
+            duration_ms = (index - start_index) * frame_ms
+            if duration_ms >= min_duration_ms:
+                segment = reference_frames[start_index:index]
+                windows.append(
+                    {
+                        "start_seconds": round(start_index * frame_ms / 1000.0, 3),
+                        "end_seconds": round(index * frame_ms / 1000.0, 3),
+                        "duration_ms": round(duration_ms, 1),
+                        "source_peak_dbfs": round(max(segment), 2),
+                        "source_median_dbfs": round(median(segment), 2),
+                    }
+                )
+            start_index = None
+    return windows
+
+
+def measure_spectral_band_deltas_db(
+    reference_samples: array,
+    processed_samples: array,
+    *,
+    sample_rate: int,
+    median_gain_db: float = 0.0,
+) -> dict[str, float]:
+    bands = (
+        ("2-4k", 2000.0, 4000.0),
+        ("4-6k", 4000.0, 6000.0),
+        ("6-8k", 6000.0, 8000.0),
+        ("8-10k", 8000.0, 10000.0),
+        ("10-12k", 10000.0, 12000.0),
+        ("12-16k", 12000.0, 16000.0),
+    )
+    usable_bands = [(name, low, high) for name, low, high in bands if high <= sample_rate / 2]
+    if not usable_bands:
+        return {}
+    window_size = min(2048, len(reference_samples), len(processed_samples))
+    if window_size < 64:
+        return {}
+    reference_energies = {name: 0.0 for name, _, _ in usable_bands}
+    processed_energies = {name: 0.0 for name, _, _ in usable_bands}
+    hop = max(window_size, 1)
+    limit = min(len(reference_samples), len(processed_samples)) - window_size + 1
+    sampled = 0
+    for start in range(0, max(limit, 1), hop):
+        reference_window = reference_samples[start : start + window_size]
+        processed_window = processed_samples[start : start + window_size]
+        if len(reference_window) < window_size or len(processed_window) < window_size:
+            continue
+        reference_rms = math.sqrt(
+            sum(float(int(value) * int(value)) for value in reference_window) / window_size
+        )
+        if _amplitude_to_dbfs(reference_rms) < -45.0:
+            continue
+        reference_spectrum = _windowed_power_spectrum(reference_window)
+        processed_spectrum = _windowed_power_spectrum(processed_window)
+        for name, low, high in usable_bands:
+            reference_energies[name] += _band_energy(reference_spectrum, sample_rate, low, high)
+            processed_energies[name] += _band_energy(processed_spectrum, sample_rate, low, high)
+        sampled += 1
+        if sampled >= 24:
+            break
+    if sampled == 0:
+        return {name: 0.0 for name, _, _ in usable_bands}
+    gain_linear = 10 ** (median_gain_db / 20.0)
+    deltas: dict[str, float] = {}
+    for name, _, _ in usable_bands:
+        reference_energy = max(reference_energies[name], 1e-20)
+        processed_energy = max(processed_energies[name] / max(gain_linear * gain_linear, 1e-20), 1e-20)
+        deltas[name] = round(10.0 * math.log10(processed_energy / reference_energy), 2)
+    return deltas
+
+
+def _windowed_power_spectrum(samples: array) -> list[float]:
+    count = len(samples)
+    if count <= 0:
+        return [0.0]
+    windowed = [
+        float(int(value)) * (0.5 - 0.5 * math.cos(2.0 * math.pi * index / max(count - 1, 1)))
+        for index, value in enumerate(samples)
+    ]
+    half = count // 2 + 1
+    spectrum: list[float] = []
+    for frequency_bin in range(half):
+        real = 0.0
+        imag = 0.0
+        angle_step = -2.0 * math.pi * frequency_bin / count
+        for index, sample in enumerate(windowed):
+            angle = angle_step * index
+            real += sample * math.cos(angle)
+            imag += sample * math.sin(angle)
+        spectrum.append(real * real + imag * imag)
+    return spectrum
+
+
+def _band_energy(spectrum: list[float], sample_rate: int, low_hz: float, high_hz: float) -> float:
+    if not spectrum:
+        return 0.0
+    bin_hz = sample_rate / max((len(spectrum) - 1) * 2, 1)
+    total = 0.0
+    for index, power in enumerate(spectrum):
+        frequency = index * bin_hz
+        if low_hz <= frequency < high_hz:
+            total += power
+    return total
+
+
+def _best_frame_level_alignment(
+    reference_frames: list[float],
+    processed_frames: list[float],
+    *,
+    active_threshold: float,
+    max_lag_frames: int = 3,
+) -> int:
+    if not reference_frames or not processed_frames:
+        return 0
+
+    best_lag = 0
+    best_score = float("-inf")
+    for lag in range(-max_lag_frames, max_lag_frames + 1):
+        pairs = [
+            (reference_frames[index], processed_frames[index + lag])
+            for index in range(len(reference_frames))
+            if 0 <= index + lag < len(processed_frames)
+            and reference_frames[index] >= active_threshold
+        ]
+        if len(pairs) < 3:
+            continue
+        reference_mean = sum(item[0] for item in pairs) / len(pairs)
+        processed_mean = sum(item[1] for item in pairs) / len(pairs)
+        covariance = sum(
+            (reference_level - reference_mean) * (processed_level - processed_mean)
+            for reference_level, processed_level in pairs
+        )
+        reference_energy = sum((item[0] - reference_mean) ** 2 for item in pairs)
+        processed_energy = sum((item[1] - processed_mean) ** 2 for item in pairs)
+        if reference_energy <= 1e-12 or processed_energy <= 1e-12:
+            score = 0.0 if lag == 0 else float("-inf")
+        else:
+            score = covariance / math.sqrt(reference_energy * processed_energy)
+        if score > best_score or (math.isclose(score, best_score) and abs(lag) < abs(best_lag)):
+            best_lag = lag
+            best_score = score
+    return best_lag
+
+
+def public_audio_diagnostics(analysis: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "evidence_level": "MODEL-INFERRED",
+        **{
+            key: value
+            for key, value in analysis.items()
+            if not key.startswith("_")
+        },
+    }
 
 
 def measure_segment_levels(
@@ -1354,16 +2337,41 @@ def measure_segment_levels(
     return _amplitude_to_dbfs(float(peak)), _amplitude_to_dbfs(rms)
 
 
+def _pause_core_pads(
+    window: NoiseWindow,
+    *,
+    core_pad_seconds: float,
+    leading_trailing_pad_seconds: float,
+    total_duration_seconds: float | None,
+) -> tuple[float, float]:
+    """Use tighter pads for leading/trailing silence; keep hold pad for mid-phrase pauses."""
+    start_pad = core_pad_seconds
+    end_pad = core_pad_seconds
+    if total_duration_seconds is None or total_duration_seconds <= 0.0:
+        return start_pad, end_pad
+
+    edge_tolerance = max(leading_trailing_pad_seconds, 0.01)
+    if window.start_seconds <= edge_tolerance:
+        start_pad = leading_trailing_pad_seconds
+    if window.end_seconds >= (total_duration_seconds - edge_tolerance):
+        end_pad = leading_trailing_pad_seconds
+    return start_pad, end_pad
+
+
 def infer_pause_residual_cleanup_windows(
     samples: array,
     *,
     sample_rate: int,
+    channels: int = 1,
     silence_candidates: list[dict[str, float]],
     min_neighbor_silence_duration: float,
     bridge_max_duration: float,
     bridge_peak_db: float,
     bridge_rms_db: float,
     core_pad_seconds: float,
+    leading_trailing_pad_seconds: float | None = None,
+    total_duration_seconds: float | None = None,
+    allow_bridge_windows: bool = True,
 ) -> list[NoiseWindow]:
     windows: list[NoiseWindow] = []
     silence_windows = [
@@ -1373,35 +2381,56 @@ def infer_pause_residual_cleanup_windows(
         )
         for item in silence_candidates
     ]
+    edge_pad_seconds = (
+        float(leading_trailing_pad_seconds)
+        if leading_trailing_pad_seconds is not None
+        else float(core_pad_seconds)
+    )
+    if total_duration_seconds is None and samples and sample_rate > 0:
+        total_duration_seconds = len(samples) / float(sample_rate * max(1, channels))
 
     for window in silence_windows:
+        start_pad, end_pad = _pause_core_pads(
+            window,
+            core_pad_seconds=core_pad_seconds,
+            leading_trailing_pad_seconds=edge_pad_seconds,
+            total_duration_seconds=total_duration_seconds,
+        )
         duration = window.end_seconds - window.start_seconds
-        if duration <= (core_pad_seconds * 2.0):
+        if duration <= (start_pad + end_pad):
             continue
-        core_start = window.start_seconds + core_pad_seconds
-        core_end = window.end_seconds - core_pad_seconds
+        core_start = window.start_seconds + start_pad
+        core_end = window.end_seconds - end_pad
         if core_end > core_start:
             windows.append(NoiseWindow(start_seconds=core_start, end_seconds=core_end))
 
-    for previous, current in zip(silence_windows, silence_windows[1:]):
-        previous_duration = previous.end_seconds - previous.start_seconds
-        current_duration = current.end_seconds - current.start_seconds
-        if previous_duration < min_neighbor_silence_duration or current_duration < min_neighbor_silence_duration:
-            continue
+    # Speech-safe AutoGate disables unpadded bridge cleanup: bridges sit outside
+    # confirmed silence cores and can clip word onsets/offsets.
+    if allow_bridge_windows:
+        for previous, current in zip(silence_windows, silence_windows[1:]):
+            previous_duration = previous.end_seconds - previous.start_seconds
+            current_duration = current.end_seconds - current.start_seconds
+            if (
+                previous_duration < min_neighbor_silence_duration
+                or current_duration < min_neighbor_silence_duration
+            ):
+                continue
 
-        bridge_start = previous.end_seconds
-        bridge_end = current.start_seconds
-        bridge_duration = bridge_end - bridge_start
-        if bridge_duration <= 0.0 or bridge_duration > bridge_max_duration:
-            continue
+            bridge_start = previous.end_seconds
+            bridge_end = current.start_seconds
+            bridge_duration = bridge_end - bridge_start
+            if bridge_duration <= 0.0 or bridge_duration > bridge_max_duration:
+                continue
 
-        peak_db, rms_db = measure_segment_levels(
-            samples,
-            start_index=int(bridge_start * sample_rate),
-            end_index=int(bridge_end * sample_rate),
-        )
-        if peak_db <= bridge_peak_db and rms_db <= bridge_rms_db:
-            windows.append(NoiseWindow(start_seconds=bridge_start, end_seconds=bridge_end))
+            peak_db, rms_db = measure_segment_levels(
+                samples,
+                start_index=int(bridge_start * sample_rate) * max(1, channels),
+                end_index=int(bridge_end * sample_rate) * max(1, channels),
+            )
+            if peak_db <= bridge_peak_db and rms_db <= bridge_rms_db:
+                windows.append(
+                    NoiseWindow(start_seconds=bridge_start, end_seconds=bridge_end)
+                )
 
     return merge_noise_windows(windows, max_gap_seconds=0.02)
 
@@ -1433,10 +2462,14 @@ def _processing_steps(
         steps.append("Breath detection via Respiro-en")
     if "spectramini" in stage_types and not skip_spectramini:
         steps.append("SpectraMini-style breath control")
-        steps.append("SpectraMini-style mouth de-click")
+        spectramini = get_pipeline_stage(preset, "spectramini")
+        if float(spectramini.get("mouth_declick_sensitivity", 0.0)) > 0.0:
+            steps.append("SpectraMini-style mouth de-click")
     if "deepfilternet" in stage_types and not skip_deepfilternet:
         steps.append("Primary denoise via DeepFilterNet")
     filters = preset["filters"]
+    if filters.get("equalizer", {}).get("enabled"):
+        steps.append("Clarity shaping via parametric equalizer")
     if filters.get("declick", {}).get("enabled"):
         steps.append("Mouth-click reduction via adeclick")
     if filters.get("breath_ducking", {}).get("enabled"):
@@ -1456,7 +2489,10 @@ def _processing_steps(
     if filters.get("breath_onset_cleanup", {}).get("enabled"):
         steps.append("Breath-onset cleanup before speech entries")
     if filters.get("pause_residual_cleanup", {}).get("enabled"):
-        steps.append("Residual pause cleanup in long silences")
+        if "silence_floor_dbfs" in filters.get("pause_residual_cleanup", {}):
+            steps.append("Speech-safe AutoGate pause cleanup to silence floor")
+        else:
+            steps.append("Residual pause cleanup in long silences")
     steps.append("Loudness normalization via loudnorm")
     steps.append("Transcript-ready MP3 export")
     return steps
@@ -1484,6 +2520,8 @@ def _noise_print_processing_steps(
         ]
     )
     filters = preset["filters"]
+    if filters.get("equalizer", {}).get("enabled"):
+        steps.append("Clarity shaping via parametric equalizer")
     if filters.get("declick", {}).get("enabled"):
         steps.append("Mouth-click reduction via adeclick")
     if filters.get("breath_ducking", {}).get("enabled"):
@@ -1501,7 +2539,10 @@ def _noise_print_processing_steps(
     if filters.get("breath_onset_cleanup", {}).get("enabled"):
         steps.append("Breath-onset cleanup before speech entries")
     if filters.get("pause_residual_cleanup", {}).get("enabled"):
-        steps.append("Residual pause cleanup in long silences")
+        if "silence_floor_dbfs" in filters.get("pause_residual_cleanup", {}):
+            steps.append("Speech-safe AutoGate pause cleanup to silence floor")
+        else:
+            steps.append("Residual pause cleanup in long silences")
     steps.append("Loudness normalization via loudnorm")
     steps.append("Transcript-ready MP3 export")
     return steps
@@ -1518,12 +2559,53 @@ def _normalize_noise_windows(noise_windows: list[NoiseWindow] | None) -> list[No
 def _load_wave_samples(audio_path: Path) -> tuple[Any, array]:
     with wave.open(str(audio_path), "rb") as reader:
         params = reader.getparams()
-        if params.sampwidth != 2 or params.nchannels != 1:
-            raise ValueError("Expected mono 16-bit WAV audio")
+        if params.sampwidth != 2 or params.nchannels <= 0:
+            raise ValueError("Expected 16-bit WAV audio with at least one channel")
         raw_frames = reader.readframes(params.nframes)
     samples = array("h")
     samples.frombytes(raw_frames)
     return params, samples
+
+
+def _downmix_interleaved_samples(samples: array, channels: int) -> array:
+    if channels <= 0:
+        raise ValueError("channels must be positive")
+    if channels == 1:
+        return array("h", samples)
+    mono = array("h")
+    for frame_start in range(0, len(samples), channels):
+        frame = samples[frame_start : frame_start + channels]
+        if not frame:
+            continue
+        average = round(sum(int(value) for value in frame) / len(frame))
+        mono.append(max(-32768, min(32767, average)))
+    return mono
+
+
+def _analysis_samples(params: Any, samples: array) -> array:
+    return _downmix_interleaved_samples(samples, int(getattr(params, "nchannels", 1)))
+
+
+def _window_rms_dbfs(
+    samples: array,
+    windows: Sequence[NoiseWindow],
+    *,
+    sample_rate: int,
+    channels: int,
+) -> float | None:
+    total_energy = 0.0
+    sample_count = 0
+    for window in windows:
+        start = max(0, int(window.start_seconds * sample_rate) * channels)
+        end = min(len(samples), int(window.end_seconds * sample_rate) * channels)
+        if end <= start:
+            continue
+        for value in samples[start:end]:
+            total_energy += float(int(value) * int(value))
+            sample_count += 1
+    if sample_count == 0:
+        return None
+    return _amplitude_to_dbfs(math.sqrt(total_energy / sample_count))
 
 
 def _read_wave_duration_seconds(audio_path: Path) -> float:
@@ -1677,22 +2759,40 @@ def process_media_file(
     skip_deepfilternet: bool = False,
 ) -> dict[str, Any]:
     metadata = input_metadata or ffprobe_media(input_file, runtime.ffprobe_bin)
+    processing_format = resolve_processing_format(metadata, preset)
     layout = build_output_layout(input_path=input_file, output_root=output_root, run_slug=run_slug)
     resolved_noise_windows = _normalize_noise_windows(noise_windows)
     noise_sample_duration = _noise_sample_duration(resolved_noise_windows) if resolved_noise_windows else None
+    respiro_stage = get_pipeline_stage(preset, "respiro")
+    spectramini_stage = get_pipeline_stage(preset, "spectramini")
+    deepfilternet_stage = get_pipeline_stage(preset, "deepfilternet")
+    respiro_enabled = bool(respiro_stage.get("enabled", True))
+    spectramini_enabled = bool(spectramini_stage.get("enabled", True))
+    deepfilternet_enabled = bool(deepfilternet_stage.get("enabled", True))
+    apply_spectramini = spectramini_enabled and not skip_spectramini
+    apply_deepfilternet = deepfilternet_enabled and not skip_deepfilternet
 
     ffmpeg = runtime.ffmpeg_bin if runtime.dry_run else ensure_tool(runtime.ffmpeg_bin)
-    python_bin = runtime.python_executable or resolve_repo_python(PROJECT_ROOT)
+    python_bin = runtime.python_executable or resolve_repo_python(
+        PROJECT_ROOT,
+        require_venv=True,
+    )
     if not runtime.dry_run:
         python_bin = ensure_tool(python_bin)
 
     commands: list[list[str]] = [
-        build_ffmpeg_extract_command(input_path=input_file, raw_wav=layout.raw_wav, preset=preset, ffmpeg_bin=ffmpeg),
+        build_ffmpeg_extract_command(
+            input_path=input_file,
+            raw_wav=layout.raw_wav,
+            preset=preset,
+            ffmpeg_bin=ffmpeg,
+            processing_format=processing_format,
+        ),
     ]
-    if not skip_deepfilternet:
+    if apply_deepfilternet:
         commands.append(
             build_deepfilternet_command(
-                raw_wav=layout.raw_wav,
+                raw_wav=layout.breath_wav,
                 output_dir=layout.deepfilternet_dir,
                 preset=preset,
                 python_executable=python_bin,
@@ -1706,6 +2806,7 @@ def process_media_file(
                 noise_windows=resolved_noise_windows,
                 preset=preset,
                 ffmpeg_bin=ffmpeg,
+                processing_format=processing_format,
             )
         )
     commands.extend(
@@ -1717,20 +2818,21 @@ def process_media_file(
             ffmpeg_bin=ffmpeg,
             noise_sample_wav=layout.noise_sample_wav if resolved_noise_windows else None,
             noise_sample_duration=noise_sample_duration,
+            processing_format=processing_format,
         )
     )
 
     processing_steps = (
         _noise_print_processing_steps(
             preset,
-            skip_spectramini=skip_spectramini,
-            skip_deepfilternet=skip_deepfilternet,
+            skip_spectramini=not apply_spectramini,
+            skip_deepfilternet=not apply_deepfilternet,
         )
         if resolved_noise_windows
         else _processing_steps(
             preset,
-            skip_spectramini=skip_spectramini,
-            skip_deepfilternet=skip_deepfilternet,
+            skip_spectramini=not apply_spectramini,
+            skip_deepfilternet=not apply_deepfilternet,
         )
     )
 
@@ -1740,6 +2842,11 @@ def process_media_file(
         "backend": "local",
         "input_file": str(input_file),
         "input_metadata": metadata,
+        "source_format": {
+            "sample_rate": processing_format["sample_rate"],
+            "channels": processing_format["channels"],
+        },
+        "processing_format": dict(processing_format),
         "processing_steps": processing_steps,
         "commands": commands,
         "dry_run": runtime.dry_run,
@@ -1753,6 +2860,7 @@ def process_media_file(
             "preprocess_dir": str(layout.preprocess_dir),
             "transcript_dir": str(layout.transcript_dir),
             "raw_wav": str(layout.raw_wav),
+            "breath_wav": str(layout.breath_wav),
             "denoised_wav": str(layout.denoised_wav),
             "noise_sample_wav": str(layout.noise_sample_wav),
             "clean_wav": str(layout.clean_wav),
@@ -1776,8 +2884,39 @@ def process_media_file(
         "respiro_command": None,
         "respiro_stdout": "",
         "respiro_stderr": "",
+        "respiro_breath_windows": [],
+        "auxiliary_breath_windows": [],
+        "breath_window_evidence": [],
+        "breath_cleanup": {
+            "status": "NOT_APPLICABLE",
+            "first_pass": [],
+            "second_pass": [],
+            "final_pass": [],
+            "final_residual_windows": [],
+            "failures": [],
+        },
         "spectramini_applied": False,
+        "stage_status": {
+            "respiro": {"enabled": respiro_enabled, "applied": False},
+            "spectramini": {"enabled": spectramini_enabled, "applied": False},
+            "deepfilternet": {"enabled": deepfilternet_enabled, "applied": False},
+        },
         "pause_residual_cleanup_windows": [],
+        "pause_cleanup": {
+            "status": "NOT_APPLICABLE",
+            "mode": None,
+            "target_dbfs": None,
+            "silence_floor_dbfs": None,
+            "window_evidence": [],
+            "first_pass": [],
+            "second_pass": [],
+            "final_residual_windows": [],
+            "attenuation_stats": {},
+            "failures": [],
+        },
+        "input_diagnostics": None,
+        "output_diagnostics": None,
+        "quality_guard": None,
     }
 
     if runtime.dry_run:
@@ -1799,53 +2938,202 @@ def process_media_file(
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "command failed")
 
-    respiro_stage = get_pipeline_stage(preset, "respiro")
+    raw_params, raw_samples = _load_wave_samples(layout.raw_wav)
+    input_mono = _analysis_samples(raw_params, raw_samples)
+    input_analysis = analyze_pcm16_samples(
+        input_mono,
+        sample_rate=raw_params.framerate,
+        frame_ms=10.0,
+    )
+    report["input_diagnostics"] = public_audio_diagnostics(input_analysis)
+    adaptive_decision = select_adaptive_profile(input_analysis)
+    report["adaptive_profile"] = adaptive_decision
+    if preset_name == "natural":
+        active_preset = apply_adaptive_profile(preset, adaptive_decision)
+        input_adaptations: list[str] = []
+    else:
+        active_preset, input_adaptations = apply_input_safety_overrides(
+            preset_name,
+            preset,
+            input_analysis,
+        )
+    report["input_adaptations"] = input_adaptations
+    if active_preset is not preset:
+        tail_start = 1 + int(apply_deepfilternet)
+        adaptive_tail: list[list[str]] = []
+        if resolved_noise_windows:
+            adaptive_tail.append(
+                build_ffmpeg_noise_sample_command(
+                    source_wav=layout.denoised_wav,
+                    noise_sample_wav=layout.noise_sample_wav,
+                    noise_windows=resolved_noise_windows,
+                    preset=active_preset,
+                    ffmpeg_bin=ffmpeg,
+                    processing_format=processing_format,
+                )
+            )
+        adaptive_tail.extend(
+            build_ffmpeg_finalize_commands(
+                denoised_wav=layout.denoised_wav,
+                clean_wav=layout.clean_wav,
+                transcript_mp3=layout.transcript_mp3,
+                preset=active_preset,
+                ffmpeg_bin=ffmpeg,
+                noise_sample_wav=layout.noise_sample_wav if resolved_noise_windows else None,
+                noise_sample_duration=noise_sample_duration,
+                processing_format=processing_format,
+            )
+        )
+        commands[tail_start:] = adaptive_tail
+        report["commands"] = commands
+        report["processing_steps"] = (
+            _noise_print_processing_steps(
+                active_preset,
+                skip_spectramini=not apply_spectramini,
+                skip_deepfilternet=not apply_deepfilternet,
+            )
+            if resolved_noise_windows
+            else _processing_steps(
+                active_preset,
+                skip_spectramini=not apply_spectramini,
+                skip_deepfilternet=not apply_deepfilternet,
+            )
+        )
+
     fallback_config = {
         **DEFAULT_BREATH_FALLBACK_CONFIG,
         **preset.get("filters", {}).get("breath_onset_cleanup", {}),
     }
-    threshold = float(respiro_threshold if respiro_threshold is not None else respiro_stage.get("threshold", 0.064))
-    min_length = int(respiro_min_length_ms if respiro_min_length_ms is not None else respiro_stage.get("min_length_ms", 20))
-    respiro_result = run_respiro_or_fallback_detection(
-        audio_path=layout.raw_wav,
-        ffmpeg_bin=runtime.ffmpeg_bin,
-        respiro_repo=respiro_repo,
-        respiro_weights=respiro_weights,
-        python_executable=python_bin,
-        threshold=threshold,
-        min_length_ms=min_length,
-        fallback_config=fallback_config,
+    breath_cleanup_policy = active_preset.get("filters", {}).get(
+        "breath_cleanup_policy",
+        {},
     )
-    breath_windows = respiro_result.windows
+    breath_windows: list[NoiseWindow] = []
+    respiro_windows: list[NoiseWindow] = []
+    if respiro_enabled:
+        threshold = float(respiro_threshold if respiro_threshold is not None else respiro_stage.get("threshold", 0.064))
+        min_length = int(respiro_min_length_ms if respiro_min_length_ms is not None else respiro_stage.get("min_length_ms", 20))
+        respiro_result = run_respiro_or_fallback_detection(
+            audio_path=layout.raw_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            respiro_repo=respiro_repo,
+            respiro_weights=respiro_weights,
+            python_executable=python_bin,
+            threshold=threshold,
+            min_length_ms=min_length,
+            fallback_config=fallback_config,
+        )
+        respiro_windows = respiro_result.windows
+        breath_windows = respiro_windows
+        report["respiro_detection_mode"] = respiro_result.mode
+        report["respiro_assets_present"] = respiro_result.assets_present
+        report["respiro_attempted"] = respiro_result.attempted
+        report["respiro_succeeded"] = respiro_result.succeeded
+        report["respiro_returncode"] = respiro_result.returncode
+        report["respiro_error"] = respiro_result.error
+        report["respiro_command"] = respiro_result.command
+        report["respiro_stdout"] = respiro_result.stdout
+        report["respiro_stderr"] = respiro_result.stderr
+    auxiliary_windows: list[NoiseWindow] = []
+    if breath_cleanup_policy.get("enabled") and breath_cleanup_policy.get(
+        "merge_auxiliary_detection",
+        True,
+    ):
+        auxiliary_windows = detect_breath_onset_windows(
+            layout.raw_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            config=fallback_config,
+        )
+        auxiliary_windows, auxiliary_spectral_evidence = (
+            filter_noise_like_breath_windows(
+                raw_samples,
+                windows=auxiliary_windows,
+                sample_rate=raw_params.framerate,
+                channels=raw_params.nchannels,
+            )
+        )
+        report["auxiliary_spectral_evidence"] = auxiliary_spectral_evidence
+        breath_windows, breath_evidence = build_effective_breath_windows(
+            respiro_windows=respiro_windows,
+            auxiliary_windows=auxiliary_windows,
+            source_analysis=input_analysis,
+        )
+        report["breath_window_evidence"] = breath_evidence
+    report["respiro_breath_windows"] = [
+        {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
+        for window in respiro_windows
+    ]
+    report["auxiliary_breath_windows"] = [
+        {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
+        for window in auxiliary_windows
+    ]
     report["breath_onset_windows"] = [
         {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
         for window in breath_windows
     ]
-    report["respiro_detection_mode"] = respiro_result.mode
-    report["respiro_assets_present"] = respiro_result.assets_present
-    report["respiro_attempted"] = respiro_result.attempted
-    report["respiro_succeeded"] = respiro_result.succeeded
-    report["respiro_returncode"] = respiro_result.returncode
-    report["respiro_error"] = respiro_result.error
-    report["respiro_command"] = respiro_result.command
-    report["respiro_stdout"] = respiro_result.stdout
-    report["respiro_stderr"] = respiro_result.stderr
-
-    if layout.raw_wav.exists() and (breath_windows or not skip_spectramini):
-        params, samples = _load_wave_samples(layout.raw_wav)
-        spectramini_stage = get_pipeline_stage(preset, "spectramini")
-        cleaned = apply_spectramini_style_cleanup_to_samples(
-            samples,
-            breath_windows=breath_windows,
-            sample_rate=params.framerate,
-            attenuation_db=attenuation_db,
-            mouth_declick_sensitivity=float(spectramini_stage.get("mouth_declick_sensitivity", 0.55)),
-            fade_ms=float(fallback_config.get("fade_ms", 14.0)),
+    report["stage_status"]["respiro"]["applied"] = bool(
+        respiro_enabled
+        and report.get("respiro_succeeded")
+        and (
+            not breath_cleanup_policy.get("enabled")
+            or any(
+                "respiro" in item.get("sources", [])
+                and item.get("decision") == "accepted"
+                for item in report["breath_window_evidence"]
+            )
         )
-        _write_wave_samples(layout.raw_wav, params, cleaned)
-        report["spectramini_applied"] = not skip_spectramini
+    )
 
-    if not skip_deepfilternet:
+    shutil.copyfile(layout.raw_wav, layout.breath_wav)
+    if layout.breath_wav.exists() and apply_spectramini:
+        params, samples = _load_wave_samples(layout.breath_wav)
+        if breath_cleanup_policy.get("enabled"):
+            cleaned, first_pass_details = apply_adaptive_breath_cleanup(
+                samples,
+                windows=breath_windows,
+                sample_rate=params.framerate,
+                channels=params.nchannels,
+                max_attenuation_db=float(
+                    breath_cleanup_policy["first_pass_max_attenuation_db"]
+                ),
+                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+                context_ms=float(breath_cleanup_policy["context_ms"]),
+                fade_ms=float(breath_cleanup_policy["fade_ms"]),
+            )
+            report["breath_cleanup"]["first_pass"] = first_pass_details
+        else:
+            cleaned = apply_spectramini_style_cleanup_to_samples(
+                samples,
+                breath_windows=breath_windows,
+                sample_rate=params.framerate,
+                attenuation_db=attenuation_db,
+                mouth_declick_sensitivity=float(spectramini_stage.get("mouth_declick_sensitivity", 0.55)),
+                fade_ms=float(fallback_config.get("fade_ms", 14.0)),
+                channels=raw_params.nchannels,
+            )
+        before_breath_dbfs = _window_rms_dbfs(
+            samples,
+            breath_windows,
+            sample_rate=params.framerate,
+            channels=params.nchannels,
+        )
+        after_breath_dbfs = _window_rms_dbfs(
+            cleaned,
+            breath_windows,
+            sample_rate=params.framerate,
+            channels=params.nchannels,
+        )
+        report["breath_attenuation_db"] = (
+            round(before_breath_dbfs - after_breath_dbfs, 3)
+            if before_breath_dbfs is not None and after_breath_dbfs is not None
+            else 0.0
+        )
+        _write_wave_samples(layout.breath_wav, params, cleaned)
+        samples_changed = cleaned != samples
+        report["spectramini_applied"] = samples_changed
+        report["stage_status"]["spectramini"]["applied"] = samples_changed
+
+    if apply_deepfilternet:
         deepfilter_command = commands[1]
         completed = run_command(deepfilter_command)
         executed.append(
@@ -1863,23 +3151,27 @@ def process_media_file(
         if detected_df_wav.resolve() != layout.denoised_wav.resolve():
             detected_df_wav.replace(layout.denoised_wav)
         repair_windows: list[NoiseWindow] = []
-        if layout.raw_wav.exists() and layout.denoised_wav.exists():
-            raw_params, raw_samples = _load_wave_samples(layout.raw_wav)
+        if layout.breath_wav.exists() and layout.denoised_wav.exists():
+            raw_params, raw_samples = _load_wave_samples(layout.breath_wav)
             denoised_params, denoised_samples = _load_wave_samples(layout.denoised_wav)
-            repaired_samples, repair_windows = repair_deepfilternet_speech_dropouts(
-                raw_samples,
-                denoised_samples,
-                sample_rate=denoised_params.framerate,
-            )
-            if repair_windows:
-                _write_wave_samples(layout.denoised_wav, denoised_params, repaired_samples)
+            if raw_params.nchannels == denoised_params.nchannels == 1:
+                repaired_samples, repair_windows = repair_deepfilternet_speech_dropouts(
+                    raw_samples,
+                    denoised_samples,
+                    sample_rate=denoised_params.framerate,
+                )
+                if repair_windows:
+                    _write_wave_samples(layout.denoised_wav, denoised_params, repaired_samples)
+            else:
+                report["deepfilternet_dropout_repair_skipped_reason"] = "multi_channel_input_requires_channel_safe_model_repair"
         report["deepfilternet_dropout_repair_windows"] = [
             {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
             for window in repair_windows
         ]
+        report["stage_status"]["deepfilternet"]["applied"] = True
         remaining_commands = commands[2:]
     else:
-        shutil.copyfile(layout.raw_wav, layout.denoised_wav)
+        shutil.copyfile(layout.breath_wav, layout.denoised_wav)
         report["deepfilternet_dropout_repair_windows"] = []
         remaining_commands = commands[1:]
     for command in remaining_commands:
@@ -1894,6 +3186,209 @@ def process_media_file(
         )
         if completed.returncode != 0:
             raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "command failed")
+    loudnorm_execution = executed[-2]
+
+    authorized_cleanup_windows = (
+        list(breath_windows) if breath_cleanup_policy.get("enabled") else []
+    )
+    if breath_cleanup_policy.get("enabled") and breath_windows:
+        residual_windows = detect_breath_onset_windows(
+            layout.clean_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            config=fallback_config,
+        )
+        residual_params, residual_samples = _load_wave_samples(layout.clean_wav)
+        residual_windows, residual_spectral_evidence = (
+            filter_noise_like_breath_windows(
+                residual_samples,
+                windows=residual_windows,
+                sample_rate=residual_params.framerate,
+                channels=residual_params.nchannels,
+            )
+        )
+        report["breath_cleanup"]["residual_spectral_evidence"] = (
+            residual_spectral_evidence
+        )
+        second_pass_windows, second_pass_evidence = build_effective_breath_windows(
+            respiro_windows=[],
+            auxiliary_windows=residual_windows,
+            source_analysis=input_analysis,
+        )
+        report["breath_cleanup"]["residual_evidence"] = second_pass_evidence
+        if second_pass_windows:
+            authorized_cleanup_windows.extend(second_pass_windows)
+            clean_params, clean_samples = residual_params, residual_samples
+            second_cleaned, second_pass_details = apply_adaptive_breath_cleanup(
+                clean_samples,
+                windows=second_pass_windows,
+                sample_rate=clean_params.framerate,
+                channels=clean_params.nchannels,
+                max_attenuation_db=float(
+                    breath_cleanup_policy["second_pass_max_attenuation_db"]
+                ),
+                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+                context_ms=float(breath_cleanup_policy["context_ms"]),
+                fade_ms=float(breath_cleanup_policy["fade_ms"]),
+            )
+            report["breath_cleanup"]["second_pass"] = second_pass_details
+            if second_cleaned != clean_samples:
+                _write_wave_samples(layout.clean_wav, clean_params, second_cleaned)
+                transcript_command = commands[-1]
+                completed = run_command(transcript_command)
+                executed.append(
+                    {
+                        "command": transcript_command,
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout.strip(),
+                        "stderr": completed.stderr.strip(),
+                    }
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        completed.stderr.strip()
+                        or completed.stdout.strip()
+                        or "command failed"
+                    )
+
+        final_residual_windows = detect_breath_onset_windows(
+            layout.clean_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            config=fallback_config,
+        )
+        final_params, final_samples = _load_wave_samples(layout.clean_wav)
+        final_residual_windows, final_spectral_evidence = (
+            filter_noise_like_breath_windows(
+                final_samples,
+                windows=final_residual_windows,
+                sample_rate=final_params.framerate,
+                channels=final_params.nchannels,
+            )
+        )
+        report["breath_cleanup"]["final_spectral_evidence"] = (
+            final_spectral_evidence
+        )
+        final_safe_residuals, _ = build_effective_breath_windows(
+            respiro_windows=[],
+            auxiliary_windows=final_residual_windows,
+            source_analysis=input_analysis,
+        )
+        _, final_residual_details = apply_adaptive_breath_cleanup(
+            final_samples,
+            windows=final_safe_residuals,
+            sample_rate=final_params.framerate,
+            channels=final_params.nchannels,
+            max_attenuation_db=36.0,
+            target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+            context_ms=float(breath_cleanup_policy["context_ms"]),
+            fade_ms=0.0,
+        )
+        minimum_excess_db = float(
+            breath_cleanup_policy.get("residual_min_excess_db", 3.0)
+        )
+        confirmed_final_residuals = [
+            window
+            for window, detail in zip(
+                final_safe_residuals,
+                final_residual_details,
+                strict=True,
+            )
+            if float(detail["requested_attenuation_db"]) >= minimum_excess_db
+        ]
+        if (
+            confirmed_final_residuals
+            and int(breath_cleanup_policy.get("max_retries", 1)) >= 2
+        ):
+            authorized_cleanup_windows.extend(confirmed_final_residuals)
+            final_repaired, final_repair_details = apply_adaptive_breath_cleanup(
+                final_samples,
+                windows=confirmed_final_residuals,
+                sample_rate=final_params.framerate,
+                channels=final_params.nchannels,
+                max_attenuation_db=36.0,
+                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+                context_ms=float(breath_cleanup_policy["context_ms"]),
+                fade_ms=float(breath_cleanup_policy["fade_ms"]),
+            )
+            report["breath_cleanup"]["final_repair_pass"] = final_repair_details
+            if final_repaired != final_samples:
+                _write_wave_samples(layout.clean_wav, final_params, final_repaired)
+                transcript_command = commands[-1]
+                completed = run_command(transcript_command)
+                executed.append(
+                    {
+                        "command": transcript_command,
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout.strip(),
+                        "stderr": completed.stderr.strip(),
+                    }
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        completed.stderr.strip()
+                        or completed.stdout.strip()
+                        or "command failed"
+                    )
+            final_residual_windows = detect_breath_onset_windows(
+                layout.clean_wav,
+                ffmpeg_bin=runtime.ffmpeg_bin,
+                config=fallback_config,
+            )
+            final_params, final_samples = _load_wave_samples(layout.clean_wav)
+            final_residual_windows, final_retry_spectral_evidence = (
+                filter_noise_like_breath_windows(
+                    final_samples,
+                    windows=final_residual_windows,
+                    sample_rate=final_params.framerate,
+                    channels=final_params.nchannels,
+                )
+            )
+            report["breath_cleanup"]["final_retry_spectral_evidence"] = (
+                final_retry_spectral_evidence
+            )
+            final_safe_residuals, _ = build_effective_breath_windows(
+                respiro_windows=[],
+                auxiliary_windows=final_residual_windows,
+                source_analysis=input_analysis,
+            )
+            _, final_residual_details = apply_adaptive_breath_cleanup(
+                final_samples,
+                windows=final_safe_residuals,
+                sample_rate=final_params.framerate,
+                channels=final_params.nchannels,
+                max_attenuation_db=36.0,
+                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+                context_ms=float(breath_cleanup_policy["context_ms"]),
+                fade_ms=0.0,
+            )
+            confirmed_final_residuals = [
+                window
+                for window, detail in zip(
+                    final_safe_residuals,
+                    final_residual_details,
+                    strict=True,
+                )
+                if float(detail["requested_attenuation_db"]) >= minimum_excess_db
+            ]
+        report["breath_cleanup"]["final_residual_assessment"] = (
+            final_residual_details
+        )
+        report["breath_cleanup"]["final_residual_windows"] = [
+            {
+                "start_seconds": window.start_seconds,
+                "end_seconds": window.end_seconds,
+            }
+            for window in confirmed_final_residuals
+        ]
+        if confirmed_final_residuals and breath_cleanup_policy.get(
+            "block_on_confirmed_residual",
+            True,
+        ):
+            report["breath_cleanup"]["status"] = "FAIL"
+            report["breath_cleanup"]["failures"] = [
+                "confirmed_breath_residual_after_retry"
+            ]
+        else:
+            report["breath_cleanup"]["status"] = "PASS"
 
     breath_onset_cleanup = preset.get("filters", {}).get("breath_onset_cleanup", {})
     if breath_onset_cleanup.get("enabled"):
@@ -1916,7 +3411,10 @@ def process_media_file(
     else:
         report["postprocess_breath_onset_windows"] = []
 
-    pause_residual_cleanup = preset.get("filters", {}).get("pause_residual_cleanup", {})
+    pause_residual_cleanup = active_preset.get("filters", {}).get(
+        "pause_residual_cleanup",
+        {},
+    )
     if pause_residual_cleanup.get("enabled"):
         silence_candidates = detect_silence_candidates(
             layout.clean_wav,
@@ -1925,31 +3423,389 @@ def process_media_file(
             min_duration=float(pause_residual_cleanup["silence_min_duration"]),
         )
         params, samples = _load_wave_samples(layout.clean_wav)
-        pause_windows = infer_pause_residual_cleanup_windows(
+        total_duration_seconds = (
+            len(samples) / float(params.framerate * max(1, params.nchannels))
+            if params.framerate
+            else 0.0
+        )
+        core_pad_seconds = float(pause_residual_cleanup["core_pad_ms"]) / 1000.0
+        leading_trailing_pad_seconds = (
+            float(
+                pause_residual_cleanup.get(
+                    "leading_trailing_pad_ms",
+                    pause_residual_cleanup["core_pad_ms"],
+                )
+            )
+            / 1000.0
+        )
+        allow_bridge_windows = bool(
+            pause_residual_cleanup.get(
+                "allow_bridge_windows",
+                "silence_floor_dbfs" not in pause_residual_cleanup,
+            )
+        )
+        inferred_pause_windows = infer_pause_residual_cleanup_windows(
             samples,
             sample_rate=params.framerate,
+            channels=params.nchannels,
             silence_candidates=silence_candidates,
             min_neighbor_silence_duration=float(pause_residual_cleanup["min_neighbor_silence_duration"]),
             bridge_max_duration=float(pause_residual_cleanup["bridge_max_duration"]),
             bridge_peak_db=float(pause_residual_cleanup["bridge_peak_db"]),
             bridge_rms_db=float(pause_residual_cleanup["bridge_rms_db"]),
-            core_pad_seconds=float(pause_residual_cleanup["core_pad_ms"]) / 1000.0,
+            core_pad_seconds=core_pad_seconds,
+            leading_trailing_pad_seconds=leading_trailing_pad_seconds,
+            total_duration_seconds=total_duration_seconds,
+            allow_bridge_windows=allow_bridge_windows,
         )
+        pause_windows, pause_window_evidence = build_effective_breath_windows(
+            respiro_windows=[],
+            auxiliary_windows=inferred_pause_windows,
+            source_analysis=input_analysis,
+        )
+        # Speech-safe AutoGate floor: confirmed silence cores target absolute silence,
+        # not "slightly below the measured noise floor".
+        if "silence_floor_dbfs" in pause_residual_cleanup:
+            target_dbfs = float(pause_residual_cleanup["silence_floor_dbfs"])
+            pause_mode = "speech_safe_autogate"
+        else:
+            target_dbfs = float(input_analysis["noise_floor_dbfs"]) + float(
+                pause_residual_cleanup["target_margin_db"]
+            )
+            pause_mode = "noise_floor_margin"
+        residual_measure_max_db = max(
+            36.0,
+            float(pause_residual_cleanup["max_attenuation_db"]),
+            float(pause_residual_cleanup["final_pass_max_attenuation_db"]),
+        )
+        cleaned_pause_samples, pause_cleanup_details = (
+            apply_adaptive_breath_cleanup(
+                samples,
+                windows=pause_windows,
+                sample_rate=params.framerate,
+                channels=params.nchannels,
+                max_attenuation_db=float(
+                    pause_residual_cleanup["max_attenuation_db"]
+                ),
+                target_margin_db=float(
+                    pause_residual_cleanup["target_margin_db"]
+                ),
+                context_ms=0.0,
+                fade_ms=float(pause_residual_cleanup["fade_ms"]),
+                target_dbfs_override=target_dbfs,
+            )
+        )
+        report["pause_cleanup"]["mode"] = pause_mode
+        report["pause_cleanup"]["target_dbfs"] = round(target_dbfs, 3)
+        report["pause_cleanup"]["silence_floor_dbfs"] = (
+            float(pause_residual_cleanup["silence_floor_dbfs"])
+            if "silence_floor_dbfs" in pause_residual_cleanup
+            else None
+        )
+        report["pause_cleanup"]["core_pad_ms"] = round(core_pad_seconds * 1000.0, 3)
+        report["pause_cleanup"]["leading_trailing_pad_ms"] = round(
+            leading_trailing_pad_seconds * 1000.0,
+            3,
+        )
+        report["pause_cleanup"]["allow_bridge_windows"] = allow_bridge_windows
+        report["pause_cleanup"]["window_evidence"] = pause_window_evidence
+        report["pause_cleanup"]["first_pass"] = pause_cleanup_details
+        requested_attenuations = [
+            float(detail.get("requested_attenuation_db", 0.0))
+            for detail in pause_cleanup_details
+        ]
+        report["pause_cleanup"]["attenuation_stats"] = {
+            "first_pass_window_count": len(requested_attenuations),
+            "first_pass_max_attenuation_db": (
+                round(max(requested_attenuations), 3) if requested_attenuations else 0.0
+            ),
+            "first_pass_mean_attenuation_db": (
+                round(sum(requested_attenuations) / len(requested_attenuations), 3)
+                if requested_attenuations
+                else 0.0
+            ),
+        }
         report["pause_residual_cleanup_windows"] = [
             {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
             for window in pause_windows
         ]
-        if pause_windows:
-            duck_audio_file_in_place(
-                layout.clean_wav,
-                windows=pause_windows,
-                floor_gain=float(pause_residual_cleanup["floor_gain"]),
-                fade_ms=float(pause_residual_cleanup["fade_ms"]),
+        if cleaned_pause_samples != samples:
+            _write_wave_samples(layout.clean_wav, params, cleaned_pause_samples)
+            authorized_cleanup_windows.extend(pause_windows)
+            transcript_command = commands[-1]
+            completed = run_command(transcript_command)
+            executed.append(
+                {
+                    "command": transcript_command,
+                    "returncode": completed.returncode,
+                    "stdout": completed.stdout.strip(),
+                    "stderr": completed.stderr.strip(),
+                }
             )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    completed.stderr.strip()
+                    or completed.stdout.strip()
+                    or "command failed"
+                )
+
+        _, pause_residual_details = apply_adaptive_breath_cleanup(
+            cleaned_pause_samples,
+            windows=pause_windows,
+            sample_rate=params.framerate,
+            channels=params.nchannels,
+            max_attenuation_db=residual_measure_max_db,
+            target_margin_db=float(pause_residual_cleanup["target_margin_db"]),
+            context_ms=0.0,
+            fade_ms=0.0,
+            target_dbfs_override=target_dbfs,
+        )
+        residual_minimum_db = float(
+            pause_residual_cleanup.get("residual_min_excess_db", 3.0)
+        )
+        pause_residual_windows = [
+            {
+                "start_seconds": detail["start_seconds"],
+                "end_seconds": detail["end_seconds"],
+                "remaining_excess_db": detail["requested_attenuation_db"],
+            }
+            for detail in pause_residual_details
+            if float(detail["requested_attenuation_db"]) >= residual_minimum_db
+        ]
+        if pause_residual_windows:
+            residual_noise_windows = [
+                NoiseWindow(
+                    start_seconds=float(item["start_seconds"]),
+                    end_seconds=float(item["end_seconds"]),
+                )
+                for item in pause_residual_windows
+            ]
+            second_pause_samples, second_pause_details = (
+                apply_adaptive_breath_cleanup(
+                    cleaned_pause_samples,
+                    windows=residual_noise_windows,
+                    sample_rate=params.framerate,
+                    channels=params.nchannels,
+                    max_attenuation_db=float(
+                        pause_residual_cleanup[
+                            "second_pass_max_attenuation_db"
+                        ]
+                    ),
+                    target_margin_db=float(
+                        pause_residual_cleanup["target_margin_db"]
+                    ),
+                    context_ms=0.0,
+                    fade_ms=float(pause_residual_cleanup["fade_ms"]) / 2.0,
+                    target_dbfs_override=target_dbfs,
+                )
+            )
+            report["pause_cleanup"]["second_pass"] = second_pause_details
+            if second_pause_samples != cleaned_pause_samples:
+                _write_wave_samples(
+                    layout.clean_wav,
+                    params,
+                    second_pause_samples,
+                )
+                transcript_command = commands[-1]
+                completed = run_command(transcript_command)
+                executed.append(
+                    {
+                        "command": transcript_command,
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout.strip(),
+                        "stderr": completed.stderr.strip(),
+                    }
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        completed.stderr.strip()
+                        or completed.stdout.strip()
+                        or "command failed"
+                    )
+            _, pause_residual_details = apply_adaptive_breath_cleanup(
+                second_pause_samples,
+                windows=residual_noise_windows,
+                sample_rate=params.framerate,
+                channels=params.nchannels,
+                max_attenuation_db=residual_measure_max_db,
+                target_margin_db=float(
+                    pause_residual_cleanup["target_margin_db"]
+                ),
+                context_ms=0.0,
+                fade_ms=0.0,
+                target_dbfs_override=target_dbfs,
+            )
+            pause_residual_windows = [
+                {
+                    "start_seconds": detail["start_seconds"],
+                    "end_seconds": detail["end_seconds"],
+                    "remaining_excess_db": detail[
+                        "requested_attenuation_db"
+                    ],
+                }
+                for detail in pause_residual_details
+                if float(detail["requested_attenuation_db"])
+                >= residual_minimum_db
+            ]
+        if pause_residual_windows:
+            final_pause_windows = [
+                NoiseWindow(
+                    start_seconds=float(item["start_seconds"]),
+                    end_seconds=float(item["end_seconds"]),
+                )
+                for item in pause_residual_windows
+            ]
+            final_params, final_samples = _load_wave_samples(
+                layout.clean_wav
+            )
+            final_pause_samples, final_pause_details = (
+                apply_adaptive_breath_cleanup(
+                    final_samples,
+                    windows=final_pause_windows,
+                    sample_rate=final_params.framerate,
+                    channels=final_params.nchannels,
+                    max_attenuation_db=float(
+                        pause_residual_cleanup[
+                            "final_pass_max_attenuation_db"
+                        ]
+                    ),
+                    target_margin_db=float(
+                        pause_residual_cleanup["target_margin_db"]
+                    ),
+                    context_ms=0.0,
+                    fade_ms=float(
+                        pause_residual_cleanup["final_fade_ms"]
+                    ),
+                    target_dbfs_override=target_dbfs,
+                )
+            )
+            report["pause_cleanup"]["final_pass"] = final_pause_details
+            if final_pause_samples != final_samples:
+                _write_wave_samples(
+                    layout.clean_wav,
+                    final_params,
+                    final_pause_samples,
+                )
+                transcript_command = commands[-1]
+                completed = run_command(transcript_command)
+                executed.append(
+                    {
+                        "command": transcript_command,
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout.strip(),
+                        "stderr": completed.stderr.strip(),
+                    }
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        completed.stderr.strip()
+                        or completed.stdout.strip()
+                        or "command failed"
+                    )
+            assessment_windows = trim_noise_windows_for_assessment(
+                final_pause_windows,
+                edge_seconds=float(
+                    pause_residual_cleanup[
+                        "residual_assessment_edge_ms"
+                    ]
+                )
+                / 1000.0,
+            )
+            report["pause_cleanup"]["assessment_windows"] = [
+                {
+                    "start_seconds": window.start_seconds,
+                    "end_seconds": window.end_seconds,
+                }
+                for window in assessment_windows
+            ]
+            # Trimmed assessment windows must not create a false PASS: if every
+            # residual core was too short to assess, fail closed with prior evidence.
+            if not assessment_windows:
+                report["pause_cleanup"]["failures"] = [
+                    "confirmed_pause_residual_after_cleanup",
+                    "empty_assessment_windows",
+                ]
+            else:
+                _, pause_residual_details = apply_adaptive_breath_cleanup(
+                    final_pause_samples,
+                    windows=assessment_windows,
+                    sample_rate=final_params.framerate,
+                    channels=final_params.nchannels,
+                    max_attenuation_db=residual_measure_max_db,
+                    target_margin_db=float(
+                        pause_residual_cleanup["target_margin_db"]
+                    ),
+                    context_ms=0.0,
+                    fade_ms=0.0,
+                    target_dbfs_override=target_dbfs,
+                )
+                pause_residual_windows = [
+                    {
+                        "start_seconds": detail["start_seconds"],
+                        "end_seconds": detail["end_seconds"],
+                        "remaining_excess_db": detail[
+                            "requested_attenuation_db"
+                        ],
+                    }
+                    for detail in pause_residual_details
+                    if float(detail["requested_attenuation_db"])
+                    >= residual_minimum_db
+                ]
+        report["pause_cleanup"]["final_residual_windows"] = (
+            pause_residual_windows
+        )
+        pause_failures = list(report["pause_cleanup"].get("failures") or [])
+        if pause_residual_windows and pause_residual_cleanup.get(
+            "block_on_confirmed_residual",
+            True,
+        ):
+            pause_failures.append("confirmed_pause_residual_after_cleanup")
+        if pause_failures:
+            report["pause_cleanup"]["status"] = "FAIL"
+            report["pause_cleanup"]["failures"] = list(dict.fromkeys(pause_failures))
+        else:
+            report["pause_cleanup"]["status"] = "PASS"
 
     report["executed"] = executed
-    report["loudnorm_summary"] = extract_loudnorm_summary(executed[-2]["stderr"])
+    report["loudnorm_summary"] = extract_loudnorm_summary(loudnorm_execution["stderr"])
     report["output_metadata"] = ffprobe_media(layout.clean_wav, runtime.ffprobe_bin)
+    clean_params, clean_samples = _load_wave_samples(layout.clean_wav)
+    output_mono = _analysis_samples(clean_params, clean_samples)
+    output_analysis = analyze_pcm16_samples(
+        output_mono,
+        sample_rate=clean_params.framerate,
+        frame_ms=10.0,
+    )
+    report["output_diagnostics"] = public_audio_diagnostics(output_analysis)
+    report["quality_guard"] = {
+        "evidence_level": "DIRECTLY VERIFIED",
+        **compare_audio_preservation(
+            input_analysis,
+            output_analysis,
+            reference_format=report["source_format"],
+            processed_format={
+                "sample_rate": report["output_metadata"].get("sample_rate"),
+                "channels": report["output_metadata"].get("channels"),
+            },
+            reference_samples=input_mono,
+            processed_samples=output_mono,
+            sample_rate=raw_params.framerate,
+            excluded_windows=authorized_cleanup_windows,
+        ),
+    }
+    cleanup_failures = [
+        *list(report["breath_cleanup"].get("failures") or []),
+        *list(report["pause_cleanup"].get("failures") or []),
+    ]
+    if cleanup_failures:
+        report["quality_guard"]["failures"] = list(
+            dict.fromkeys(
+                [*report["quality_guard"].get("failures", []), *cleanup_failures]
+            )
+        )
+        report["quality_guard"]["status"] = "FAIL"
+        report["quality_guard"]["release_blocked"] = True
+    report["channel_layout_preserved"] = report["quality_guard"].get("channel_layout_preserved")
 
     analysis = preset.get("analysis", {})
     if analysis.get("silence_candidates"):
@@ -1979,6 +3835,16 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         for item in report["breath_onset_windows"]
     ]
     loudnorm_block = json.dumps(report["loudnorm_summary"], indent=2) if report.get("loudnorm_summary") else "{}"
+    input_diagnostics = report.get("input_diagnostics") or {}
+    output_diagnostics = report.get("output_diagnostics") or {}
+    quality_guard = report.get("quality_guard") or {}
+    breath_cleanup = report.get("breath_cleanup") or {}
+    pause_cleanup = report.get("pause_cleanup") or {}
+    recommendation_lines = [
+        f"- `{item.get('priority', 'unknown')}` `{item.get('action', 'unknown')}`: {item.get('reason', '')}"
+        for item in input_diagnostics.get("recommendations", [])
+    ] or ["- unavailable"]
+    quality_guard_block = json.dumps(quality_guard, indent=2, ensure_ascii=False) if quality_guard else "{}"
     return "\n".join(
         [
             f"# Audio Process Report: {Path(report['input_file']).name}",
@@ -1999,6 +3865,22 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             f"- Sample rate: `{report['input_metadata'].get('sample_rate')}`",
             f"- Channels: `{report['input_metadata'].get('channels')}`",
             "",
+            "## Automatic Diagnosis",
+            f"- Evidence: `{input_diagnostics.get('evidence_level', 'UNVERIFIED')}`",
+            f"- Source noise floor: `{input_diagnostics.get('noise_floor_dbfs', 'n/a')} dBFS`",
+            f"- Source speech level: `{input_diagnostics.get('speech_level_dbfs', 'n/a')} dBFS`",
+            f"- Estimated SNR: `{input_diagnostics.get('estimated_snr_db', 'n/a')} dB`",
+            f"- Active speech range: `{input_diagnostics.get('active_dynamic_range_db', 'n/a')} dB`",
+            f"- Source clipped samples: `{input_diagnostics.get('clipped_sample_count', 'n/a')}`",
+            f"- Output clipped samples: `{output_diagnostics.get('clipped_sample_count', 'n/a')}`",
+            "- Recommendations:",
+            *recommendation_lines,
+            "",
+            "## Preservation Guard",
+            "```json",
+            quality_guard_block,
+            "```",
+            "",
             "## Noise Windows",
             *noise_window_lines,
             "",
@@ -2015,6 +3897,16 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             "",
             "## Breath Onset Windows",
             *breath_onset_lines,
+            "",
+            "## Breath Cleanup Closed Loop",
+            "```json",
+            json.dumps(breath_cleanup, indent=2, ensure_ascii=False),
+            "```",
+            "",
+            "## Pause Transition Cleanup",
+            "```json",
+            json.dumps(pause_cleanup, indent=2, ensure_ascii=False),
+            "```",
             "",
             "## Loudnorm Summary",
             "```json",

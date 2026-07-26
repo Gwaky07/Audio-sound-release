@@ -98,9 +98,13 @@ def resolve_binary(name: str, default: str, env_values: dict[str, str] | None = 
     return os.environ.get(name) or values.get(name) or default
 
 
-def resolve_repo_python(repo_root: str | Path | None = None) -> str:
+def resolve_repo_python(
+    repo_root: str | Path | None = None,
+    *,
+    require_venv: bool = False,
+) -> str:
     root = Path(repo_root) if repo_root else PROJECT_ROOT
     candidate = root / ".venv" / "Scripts" / "python.exe"
-    if candidate.exists():
+    if candidate.exists() or require_venv:
         return str(candidate)
     return sys.executable

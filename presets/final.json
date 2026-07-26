@@ -1,9 +1,10 @@
 {
   "name": "final",
-  "description": "Final spoken-word delivery preset with moderated breath and mouth-noise repair.",
+  "description": "Audible but bounded spoken-word cleanup with local breath attenuation, evidence-gated denoise, restrained clarity EQ, de-essing, and voice leveling.",
   "notes": [
-    "This is the delivery preset balancing cleanup audibility and reduced consonant damage.",
-    "It keeps click reduction and light sibilance control while avoiding the hardest dynamic shaping."
+    "Use this when the user explicitly wants a real final repair rather than a natural mastering-only baseline.",
+    "It avoids strong gating, low-pass filtering, and unconfirmed global mouth-declick so articulation and air are not traded for apparent cleanliness.",
+    "DeepFilterNet remains optional; the deterministic local chain is complete without it."
   ],
   "pipeline": {
     "stages": [
@@ -16,15 +17,15 @@
       {
         "type": "spectramini",
         "enabled": true,
-        "breath_control_reduction": 0.64,
-        "breath_control_sensitivity": 0.64,
-        "mouth_declick_sensitivity": 0.68
+        "breath_control_reduction": 0.5,
+        "breath_control_sensitivity": 0.58,
+        "mouth_declick_sensitivity": 0.0
       },
       {
         "type": "deepfilternet",
-        "enabled": true,
+        "enabled": false,
         "module": "df.enhance",
-        "post_filter": true
+        "post_filter": false
       }
     ]
   },
@@ -34,20 +35,43 @@
     "pcm_codec": "pcm_s16le"
   },
   "filters": {
-    "highpass_hz": 72,
-    "lowpass_hz": 11200,
-    "declick": {
+    "highpass_hz": 65,
+    "lowpass_hz": null,
+    "equalizer": {
       "enabled": true,
+      "bands": [
+        {
+          "frequency_hz": 250,
+          "width_type": "q",
+          "width": 1.0,
+          "gain_db": -0.6
+        },
+        {
+          "frequency_hz": 3200,
+          "width_type": "q",
+          "width": 1.0,
+          "gain_db": 0.8
+        },
+        {
+          "frequency_hz": 7500,
+          "width_type": "q",
+          "width": 0.8,
+          "gain_db": 0.2
+        }
+      ]
+    },
+    "declick": {
+      "enabled": false,
       "window": 55,
       "overlap": 75,
       "arorder": 2,
-      "threshold": 2.4,
-      "burst": 2.1
+      "threshold": 2.15,
+      "burst": 1.95
     },
     "secondary_denoise": {
       "enabled": true,
-      "nr": 12,
-      "nf": -25,
+      "nr": 5,
+      "nf": -55,
       "tracking": true
     },
     "nonlinear_denoise": {
@@ -59,25 +83,25 @@
     },
     "deesser": {
       "enabled": true,
-      "intensity": 0.15,
-      "max_deessing": 0.5,
+      "intensity": 0.08,
+      "max_deessing": 0.3,
       "frequency": 0.46
     },
     "gate": {
-      "enabled": true,
-      "threshold": 0.021,
-      "ratio": 2.5,
-      "attack_ms": 20,
-      "release_ms": 280,
-      "makeup_db": 1
+      "enabled": false,
+      "threshold": 0.01,
+      "ratio": 1.2,
+      "attack_ms": 25,
+      "release_ms": 320,
+      "makeup_db": 0
     },
     "compressor": {
       "enabled": true,
-      "threshold_db": -19,
-      "ratio": 2.0,
-      "attack_ms": 12,
-      "release_ms": 150,
-      "makeup_db": 1
+      "threshold_db": -20,
+      "ratio": 1.55,
+      "attack_ms": 18,
+      "release_ms": 200,
+      "makeup_db": 0
     },
     "speech_norm": {
       "enabled": false,
@@ -86,10 +110,63 @@
       "fall": 0.0006,
       "threshold": 0.0
     },
+    "breath_onset_cleanup": {
+      "enabled": false,
+      "low_threshold_db": -48,
+      "high_threshold_db": -30,
+      "silence_min_duration": 0.08,
+      "min_breath_ms": 70,
+      "max_breath_ms": 300,
+      "pre_roll_ms": 20,
+      "fade_ms": 18,
+      "floor_gain": 0.5,
+      "analysis_hop_ms": 18,
+      "analysis_scan_ms": 240,
+      "noise_floor_ms": 120,
+      "speech_start_ratio": 0.78,
+      "breath_over_noise_ratio": 2.8,
+      "speech_over_breath_ratio": 2.1,
+      "speech_confirm_frames": 2
+    },
+    "breath_cleanup_policy": {
+      "enabled": true,
+      "merge_auxiliary_detection": true,
+      "first_pass_max_attenuation_db": 24.0,
+      "second_pass_max_attenuation_db": 12.0,
+      "target_margin_db": 3.0,
+      "context_ms": 120.0,
+      "fade_ms": 18.0,
+      "max_retries": 2,
+      "final_residual_check": true,
+      "residual_min_excess_db": 3.0,
+      "block_on_confirmed_residual": true
+    },
+    "pause_residual_cleanup": {
+      "enabled": true,
+      "silence_threshold_db": -42.0,
+      "silence_min_duration": 0.16,
+      "min_neighbor_silence_duration": 0.12,
+      "bridge_max_duration": 0.14,
+      "bridge_peak_db": -34.0,
+      "bridge_rms_db": -44.0,
+      "allow_bridge_windows": false,
+      "core_pad_ms": 45.0,
+      "leading_trailing_pad_ms": 25.0,
+      "silence_floor_dbfs": -96.0,
+      "target_margin_db": -6.0,
+      "max_attenuation_db": 48.0,
+      "second_pass_max_attenuation_db": 24.0,
+      "fade_ms": 12.0,
+      "final_pass_max_attenuation_db": 36.0,
+      "final_fade_ms": 6.0,
+      "residual_assessment_edge_ms": 6.0,
+      "residual_min_excess_db": 3.0,
+      "block_on_confirmed_residual": true
+    },
     "loudnorm": {
-      "target_i": -16.8,
+      "target_i": -17.5,
       "target_lra": 7.0,
-      "target_tp": -3.0
+      "target_tp": -2.5
     }
   },
   "analysis": {
