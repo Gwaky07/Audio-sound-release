@@ -38,7 +38,9 @@ Respiro、DeepFilterNet 和组合模型候选只在运行时真实可用且输�
 ### 3. 确定性处理与质量守门
 
 - `audio_sound/pipeline.py`：媒体探测、格式保持、确定性修音、报告和 preservation guard
-- `audio_sound/config.py`、`presets/*.json`：固定预设及受控覆盖
+- `audio_sound/media_utils.py`：唯一的 PCM16 WAV 读取、秒数格式化、SHA-256 和 MP3 导出实现
+- `audio_sound/config.py`、`presets/*.json`：仓库内可编辑固定预设及受控覆盖
+- `audio_sound/presets/*.json`：wheel 内置预设镜像，由测试保证与根目录预设逐字节一致
 
 `final` 主链按证据执行：
 
@@ -86,6 +88,10 @@ Respiro、DeepFilterNet 和组合模型候选只在运行时真实可用且输�
 ## 打包与兼容
 
 `audio_sound` 是主包。`scripts` 作为兼容包一并安装，确保历史 `narrow_onset_cleanup` 模块在 editable install、wheel 和 `git archive` 安装后仍可导入；新业务逻辑应继续向 `audio_sound` 收敛。
+
+wheel 内置完整 presets；安装到仓库外的新 venv 后，`audio-cleanup list-presets`、`audio-skill-workflow --dry-run` 与无模型确定性 `final` 链仍可运行。CI 在 Python 3.10/3.11 跑全量测试，并在 Python 3.11 的隔离 wheel 环境执行真实 FFmpeg final smoke 与独立 pair guard。
+
+`process_media_file()` 是阶段编排器；停顿清理与呼吸残留闭环分别由 `_run_pause_cleanup()`、`_run_breath_residual_cleanup()` 承担，命令执行统一由 `_run_recorded_command()` 记录和 fail-closed。
 
 ## 参考输入而非运行时依赖
 

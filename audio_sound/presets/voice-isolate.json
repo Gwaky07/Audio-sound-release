@@ -1,0 +1,145 @@
+{
+  "name": "voice-isolate",
+  "description": "AU-style spoken-word cleanup that uses captured noise-only windows to suppress non-voice residue while protecting word onsets.",
+  "notes": [
+    "Use this with --noise-window to capture a clean room-tone or environment-noise sample from the same file.",
+    "The sampled denoise stage should do most of the cleanup; the follow-up voice chain stays intentionally lighter than repair."
+  ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.05,
+        "min_length_ms": 20
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.65,
+        "breath_control_sensitivity": 0.65,
+        "mouth_declick_sensitivity": 0.7
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
+  "extract": {
+    "sample_rate": 48000,
+    "channels": 1,
+    "pcm_codec": "pcm_s16le"
+  },
+  "filters": {
+    "highpass_hz": 75,
+    "lowpass_hz": 10800,
+    "declick": {
+      "enabled": true,
+      "window": 55,
+      "overlap": 75,
+      "arorder": 2,
+      "threshold": 2.15,
+      "burst": 1.95
+    },
+    "breath_ducking": {
+      "enabled": false,
+      "threshold": 0.028,
+      "ratio": 8.0,
+      "attack_ms": 8,
+      "release_ms": 180,
+      "range": 0.12,
+      "detection": "peak",
+      "link": "maximum",
+      "level_sc": 1.5,
+      "detector_highpass_hz": 140,
+      "detector_lowpass_hz": 2200,
+      "detector_threshold_db": -26,
+      "detector_ratio": 3.0,
+      "detector_attack_ms": 4,
+      "detector_release_ms": 120,
+      "detector_makeup_db": 3
+    },
+    "breath_onset_cleanup": {
+      "enabled": false,
+      "low_threshold_db": -44,
+      "high_threshold_db": -32,
+      "silence_min_duration": 0.08,
+      "min_breath_ms": 70,
+      "max_breath_ms": 320,
+      "pre_roll_ms": 25,
+      "fade_ms": 14,
+      "floor_gain": 0.0,
+      "analysis_hop_ms": 18,
+      "analysis_scan_ms": 260,
+      "noise_floor_ms": 120,
+      "speech_start_ratio": 0.78,
+      "breath_over_noise_ratio": 2.6,
+      "speech_over_breath_ratio": 2.15,
+      "speech_confirm_frames": 2
+    },
+    "secondary_denoise": {
+      "enabled": true,
+      "nr": 11,
+      "nf": -30,
+      "tracking": false,
+      "residual_floor": -44,
+      "adaptivity": 0.5,
+      "floor_offset": 0.75,
+      "gain_smooth": 12,
+      "noise_link": "average"
+    },
+    "nonlinear_denoise": {
+      "enabled": false,
+      "strength": 0.02,
+      "patch": 0.002,
+      "research": 0.006,
+      "smooth": 11
+    },
+    "deesser": {
+      "enabled": true,
+      "intensity": 0.1,
+      "max_deessing": 0.4,
+      "frequency": 0.46
+    },
+    "gate": {
+      "enabled": false,
+      "threshold": 0.008,
+      "ratio": 1.2,
+      "attack_ms": 4,
+      "release_ms": 360,
+      "makeup_db": 0
+    },
+    "compressor": {
+      "enabled": true,
+      "threshold_db": -20,
+      "ratio": 1.45,
+      "attack_ms": 14,
+      "release_ms": 190,
+      "makeup_db": 1
+    },
+    "speech_norm": {
+      "enabled": false,
+      "expansion": 1.0,
+      "raise": 0.0008,
+      "fall": 0.0006,
+      "threshold": 0.0
+    },
+    "loudnorm": {
+      "target_i": -16.8,
+      "target_lra": 7.0,
+      "target_tp": -3.0
+    }
+  },
+  "analysis": {
+    "silence_candidates": false,
+    "silence_threshold_db": -40,
+    "silence_min_duration": 0.3
+  },
+  "transcript_export": {
+    "codec": "libmp3lame",
+    "bitrate": "192k"
+  }
+}

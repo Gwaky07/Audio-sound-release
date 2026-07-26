@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PRESETS_DIR = PROJECT_ROOT / "presets"
+REPOSITORY_PRESETS_DIR = PROJECT_ROOT / "presets"
+PACKAGE_PRESETS_DIR = Path(__file__).resolve().parent / "presets"
+PRESETS_DIR = (
+    REPOSITORY_PRESETS_DIR
+    if REPOSITORY_PRESETS_DIR.is_dir()
+    else PACKAGE_PRESETS_DIR
+)
 
 
 def list_presets() -> list[str]:

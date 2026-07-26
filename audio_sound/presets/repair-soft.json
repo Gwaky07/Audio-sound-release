@@ -1,0 +1,104 @@
+{
+  "name": "repair-soft",
+  "description": "Softer spoken-word repair preset that keeps click cleanup but backs off aggressive gating and leveling.",
+  "notes": [
+    "Use when repair removes too much of consonant onsets or word tails.",
+    "This preset aims for a narrower fix: reduce mouth noise and breathing gently without obvious truncation."
+  ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.07,
+        "min_length_ms": 20
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.6,
+        "breath_control_sensitivity": 0.6,
+        "mouth_declick_sensitivity": 0.65
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
+  "extract": {
+    "sample_rate": 48000,
+    "channels": 1,
+    "pcm_codec": "pcm_s16le"
+  },
+  "filters": {
+    "highpass_hz": 72,
+    "lowpass_hz": 11500,
+    "declick": {
+      "enabled": true,
+      "window": 55,
+      "overlap": 75,
+      "arorder": 2,
+      "threshold": 2.2,
+      "burst": 2.0
+    },
+    "secondary_denoise": {
+      "enabled": true,
+      "nr": 11,
+      "nf": -25,
+      "tracking": true
+    },
+    "nonlinear_denoise": {
+      "enabled": false,
+      "strength": 0.03,
+      "patch": 0.002,
+      "research": 0.006,
+      "smooth": 11
+    },
+    "deesser": {
+      "enabled": true,
+      "intensity": 0.12,
+      "max_deessing": 0.45,
+      "frequency": 0.46
+    },
+    "gate": {
+      "enabled": true,
+      "threshold": 0.019,
+      "ratio": 2.3,
+      "attack_ms": 18,
+      "release_ms": 260,
+      "makeup_db": 1
+    },
+    "compressor": {
+      "enabled": true,
+      "threshold_db": -19,
+      "ratio": 2.0,
+      "attack_ms": 12,
+      "release_ms": 150,
+      "makeup_db": 1
+    },
+    "speech_norm": {
+      "enabled": false,
+      "expansion": 1.0,
+      "raise": 0.0008,
+      "fall": 0.0006,
+      "threshold": 0.0
+    },
+    "loudnorm": {
+      "target_i": -16.8,
+      "target_lra": 7.0,
+      "target_tp": -3.0
+    }
+  },
+  "analysis": {
+    "silence_candidates": false,
+    "silence_threshold_db": -38,
+    "silence_min_duration": 0.12
+  },
+  "transcript_export": {
+    "codec": "libmp3lame",
+    "bitrate": "192k"
+  }
+}

@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 
 from audio_sound.config import (
+    PACKAGE_PRESETS_DIR,
+    REPOSITORY_PRESETS_DIR,
     apply_runtime_overrides,
     list_presets,
     load_env_file,
@@ -15,6 +17,18 @@ from audio_sound.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_packaged_presets_match_repository_presets(self) -> None:
+        repository_files = {
+            path.name: path.read_bytes()
+            for path in REPOSITORY_PRESETS_DIR.glob("*.json")
+        }
+        packaged_files = {
+            path.name: path.read_bytes()
+            for path in PACKAGE_PRESETS_DIR.glob("*.json")
+        }
+        self.assertTrue(repository_files)
+        self.assertEqual(packaged_files, repository_files)
+
     def test_resolve_repo_python_can_require_repository_venv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             expected = Path(tmp_dir) / ".venv" / "Scripts" / "python.exe"

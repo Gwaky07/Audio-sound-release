@@ -163,17 +163,20 @@ Do not claim Respiro-en, DeepFilterNet, or SpectraMini were used unless `doctor`
 8. 窄窗 onset / 参考风格清理逻辑住在 `audio_sound/narrow_onset_cleanup.py`；`scripts/narrow_onset_cleanup.py` 只是 CLI 薄包装。业务代码必须 `from audio_sound.narrow_onset_cleanup import ...` 或相对导入 `.narrow_onset_cleanup`，不得再把核心算法绑在 `scripts.*` 上。
 9. `detect_runtime()` 未传 `repo_root` 时必须默认仓库 `PROJECT_ROOT`，不得依赖当前工作目录去找 `tools/`。
 10. 独立发布验证是强制能力：`audio_sound/delivery_verifier.py` / `verify_delivery.cmd` / `audio-verify-delivery`。修音意图下必须加 `--repair-intent`，以阻断 `delivery_incomplete_for_repair_intent` 与非 PASS 的 `repair_scorecard`。接受 `audio_process_report.json`、`skill-file-report.json`（含 `core_report`）或 workflow summary；报告内 `deliverables.wav|mp3` 若存在，必须与 CLI 传入的最终媒体路径解析为同一文件。
+11. 通用媒体能力只允许在 `audio_sound/media_utils.py` 维护一份：PCM16 WAV 读取、秒数格式化、SHA-256、MP3 命令与导出不得在 workflow、pipeline、release audit、delivery verifier 或 segment removal 中复制实现。
+12. `process_media_file()` 是主编排器；停顿清理、呼吸残留闭环和命令执行记录必须由独立 helper 承担。架构测试将该函数限制在 600 行以内，不得再次把完整算法堆回单个千行函数。
 
 ## Package, Runtime, And CI Enforcement
 
 这些规则把“文档里写了”变成“安装与 CI 会挡住”的约束；Agent 改代码时不得绕开：
 
-1. **可安装包**：`pyproject.toml` 提供 `audio-cleanup`、`audio-skill-workflow`、`audio-remove-segments`、`audio-audit-release`、`audio-verify-delivery`。`setup.cmd` 必须 `pip install --editable .` 到仓库 `.venv`。
+1. **可安装包**：`pyproject.toml` 提供 `audio-cleanup`、`audio-skill-workflow`、`audio-remove-segments`、`audio-audit-release`、`audio-verify-delivery`。`setup.cmd` 必须 `pip install --editable .` 到仓库 `.venv`。wheel 必须内置 `audio_sound/presets/*.json`；仓库根 `presets/*.json` 是可编辑源，两份内容必须由测试逐字节校验，禁止漂移。
 2. **Python**：仅 3.10 / 3.11；处理与模型必须用 `.venv\Scripts\python.exe`。
-3. **源码安装冒烟**：CI 必须 `git archive` 后在检出目录外 `pip install`，并至少导入 `audio_sound.auto_workflow`、`audio_sound.agent_judgment`、`audio_sound.skill_workflow`、`audio_sound.narrow_onset_cleanup`、`audio_sound.delivery_verifier`，再跑 `audio-skill-workflow ... --dry-run`。
-4. **测试门禁**：`.github/workflows/ci.yml` 必须跑全量 `pytest`；不得把完整 `setup.cmd`（含 torch / Respiro 资产）当作 CI 阻断步骤。缺少 bundled `tools/`、仓库内 `ffmpeg/`、模型权重时，`doctor` 可以失败或仅信息性记录，但**不得**因此让无模型依赖的单元测试失败。
-5. **对比与验证模块**：`scripts/evaluate_audio_pair.py` 是薄入口，核心在 `audio_sound/pair_evaluation.py`；独立无排除对比与 `verify_delivery` 不得传授权排除窗口来“洗绿”报告。
-6. **禁止提交**：`.venv/`、`.env`、`tools/`、`output/`、`scratch/`、`.omx/`、`__pycache__/`、`*.egg-info/`；分享前可跑 `python scripts/audio_cleanup.py clean-repo`。
+3. **源码安装冒烟**：CI 必须 `git archive` 后构建 wheel，在检出目录外新建 venv 安装，并至少导入 `audio_sound.auto_workflow`、`audio_sound.agent_judgment`、`audio_sound.skill_workflow`、`audio_sound.narrow_onset_cleanup`、`audio_sound.delivery_verifier`，验证 packaged presets 后再跑 `audio-skill-workflow ... --dry-run`。
+4. **测试门禁**：`.github/workflows/ci.yml` 必须在 Python 3.10 / 3.11 跑全量 `pytest`，并在隔离 wheel 环境用合成口播样本真实执行一次无模型 `final` 确定性链，生成 WAV/MP3、确认格式保持，再做独立 pair guard PASS。不得把完整 `setup.cmd`（含 torch / Respiro 资产）当作 CI 阻断步骤。
+5. **运行时诊断门禁**：CI 必须解析 `doctor`，确认 Python 受支持且 Respiro / DeepFilterNet capability state 字段存在。缺少 bundled `tools/`、仓库内 `ffmpeg/`、模型权重时，模型 `ready=false` 是可接受事实，但不得伪造 ready，也不得让无模型单元测试失败。
+6. **对比与验证模块**：`scripts/evaluate_audio_pair.py` 是薄入口，核心在 `audio_sound/pair_evaluation.py`；独立无排除对比与 `verify_delivery` 不得传授权排除窗口来“洗绿”报告。
+7. **禁止提交**：`.venv/`、`.env`、`tools/`、`output/`、`scratch/`、`.omx/`、`__pycache__/`、`*.egg-info/`；分享前可跑 `python scripts/audio_cleanup.py clean-repo`。
 
 ## Mandatory Audio Self-Audit Before Completion
 
@@ -283,15 +286,12 @@ Before sharing source, run:
 python scripts/audio_cleanup.py clean-repo
 ```
 
-## Known Gaps Agents Must Not Paper Over
+## External Verification Boundaries
 
-下列项**尚未**完全产品化；Agent 不得假装已经解决，也不得用口头保证替代实现：
+实现层面的已知尾项不得留在口头说明中：wheel 预设、Python 3.10/3.11、真实确定性 final smoke、共享媒体工具和超长流程拆分均由代码与 CI 门禁。仍有两类证据天然不能由无资产 CI 伪造：
 
-1. **Wheel 外置 `presets/`**：当前 `PRESETS_DIR` 仍相对仓库根目录。纯 wheel / 非 checkout 安装后，真实 `clean` 仍可能找不到 preset 文件；CI 的 archive 冒烟覆盖 import 与 `--dry-run`，不覆盖无仓库根的完整处理。修复前，最终交付必须在仓库 checkout + editable install 环境运行。
-2. **CI 不跑真实修音链**：GitHub Actions 故意不装 torch、不依赖 `tools/` 模型权重、不把完整 `auto` 实跑作为阻断。模型可用性与听感只能靠本地 `doctor` + 真实媒体回归证明。
-3. **无感知播放能力**：本仓库 Agent 默认没有可感知试听工具。不得声称“已听过 / 听感通过”；必须请用户做最终听感确认。
-4. **`doctor` 非 CI 阻断**：模型或 bundled ffmpeg 缺失时，doctor 报告缺失是预期，不能据此把无模型单元测试标红，也不能把 doctor 缺失说成“仓库没有修音能力”。
-5. **Python 3.10 矩阵**：CI 目前以 3.11 为主；3.10 兼容靠 `requires-python` 与本地/测试保证，未强制双版本矩阵时不得假设已在 Actions 上验证 3.10。
+1. **真实模型执行**：公共 CI 不携带 `tools/Respiro-en`、权重或 torch，因此只验证 capability state 和无模型确定性 final 链。凡声称使用 Respiro / DeepFilterNet，必须在有资产的仓库 `.venv` 先跑 `doctor`，再用真实短音频与最终媒体核对 `respiro_succeeded` / `stage_status.deepfilternet.applied`、fallback、收益和伤害守门；缺少这些证据就是未验证。
+2. **感知听觉**：指标、波形、频谱和 ASR 不能替代人耳。未使用可感知播放工具时，Agent 必须把听感标为 `UNVERIFIED` 并请求用户最终确认；这是真实证据边界，不是可以通过伪造 PASS 消除的软件缺口。
 
 ## Skill Reference
 

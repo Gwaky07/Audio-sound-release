@@ -99,7 +99,7 @@ def _add_clean_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ffprobe-bin", default="ffprobe")
     parser.add_argument(
         "--python-executable",
-        default=resolve_repo_python(PROJECT_ROOT, require_venv=True),
+        default=resolve_repo_python(PROJECT_ROOT),
     )
     parser.add_argument("--dry-run", action="store_true")
 

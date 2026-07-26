@@ -5,16 +5,20 @@ on:
   pull_request:
 
 jobs:
-  test-and-package:
+  unit-test:
     runs-on: windows-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Install test runtime
@@ -32,21 +36,129 @@ jobs:
         shell: pwsh
         run: audio-skill-workflow run placeholder.wav --mode auto --dry-run
 
-      - name: Build and install from git archive
+      - name: Record doctor capabilities
         shell: pwsh
         run: |
+          $doctor = audio-cleanup doctor | ConvertFrom-Json
+          if (-not $doctor.python.ok) { throw "doctor could not inspect Python" }
+          if (-not $doctor.python.supported) { throw "unsupported Python runtime" }
+          if ($null -eq $doctor.respiro_en.ready) { throw "missing Respiro capability state" }
+          if ($null -eq $doctor.deepfilternet.ready) { throw "missing DeepFilterNet capability state" }
+
+  wheel-and-real-chain:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Ensure FFmpeg runtime
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --no-progress -y
+          }
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Build wheel from git archive
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
           $archive = Join-Path $env:RUNNER_TEMP "audio-sound.zip"
           $extract = Join-Path $env:RUNNER_TEMP "audio-sound-archive"
+          $wheelDir = Join-Path $env:RUNNER_TEMP "wheelhouse"
           git archive --format=zip --output=$archive HEAD
           Expand-Archive -Path $archive -DestinationPath $extract
-          Push-Location $extract
-          python -m pip install .
-          Pop-Location
+          python -m build --wheel $extract --outdir $wheelDir
 
-      - name: Verify installed imports outside checkout
+      - name: Install wheel outside checkout
         shell: pwsh
         run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          python -m venv $venv
+          $python = Join-Path $venv "Scripts\python.exe"
+          $wheel = Get-ChildItem (Join-Path $env:RUNNER_TEMP "wheelhouse") -Filter "*.whl" | Select-Object -First 1
+          & $python -m pip install $wheel.FullName
           Push-Location $env:RUNNER_TEMP
-          python -c "import audio_sound.auto_workflow, audio_sound.agent_judgment, audio_sound.skill_workflow, audio_sound.narrow_onset_cleanup, audio_sound.delivery_verifier"
-          audio-skill-workflow run placeholder.wav --mode auto --dry-run
+          & $python -c "import audio_sound.auto_workflow, audio_sound.agent_judgment, audio_sound.skill_workflow, audio_sound.narrow_onset_cleanup, audio_sound.delivery_verifier"
+          $presets = & (Join-Path $venv "Scripts\audio-cleanup.exe") list-presets
+          if ("final" -notin $presets -or "natural" -notin $presets) {
+            throw "wheel is missing packaged presets"
+          }
+          & (Join-Path $venv "Scripts\audio-skill-workflow.exe") run placeholder.wav --mode auto --dry-run
           Pop-Location
+
+      - name: Run deterministic final chain from installed wheel
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          $python = Join-Path $venv "Scripts\python.exe"
+          $cleanup = Join-Path $venv "Scripts\audio-cleanup.exe"
+          $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
+          $output = Join-Path $env:RUNNER_TEMP "ci-real-chain"
+          @'
+          import math, struct, sys, wave
+          sample = sys.argv[1]
+          sample_rate = 16000
+          samples = []
+          for index in range(sample_rate * 8):
+              time_s = index / sample_rate
+              active = (
+                  0.5 <= time_s < 2.5
+                  or 3.0 <= time_s < 5.0
+                  or 5.5 <= time_s < 7.5
+              )
+              if active:
+                  envelope = 0.55 + 0.35 * math.sin(
+                      2 * math.pi * 3.2 * time_s
+                  ) ** 2
+                  value = envelope * (
+                      0.55 * math.sin(2 * math.pi * 180 * time_s)
+                      + 0.28 * math.sin(2 * math.pi * 360 * time_s)
+                      + 0.12 * math.sin(2 * math.pi * 720 * time_s)
+                  )
+                  pcm = int(max(-1.0, min(1.0, value)) * 12000)
+              else:
+                  pcm = int(8 * math.sin(2 * math.pi * 73 * time_s))
+              samples.append(pcm)
+          with wave.open(sample, "wb") as output:
+              output.setnchannels(1)
+              output.setsampwidth(2)
+              output.setframerate(sample_rate)
+              output.writeframes(
+                  struct.pack("<" + "h" * len(samples), *samples)
+              )
+          '@ | & $python - $sample
+          & $cleanup clean $sample --preset final --skip-spectramini --skip-deepfilternet --output-dir $output
+          $report = Get-ChildItem $output -Recurse -Filter "audio_process_report.json" | Select-Object -First 1
+          if (-not $report) { throw "real-chain report was not generated" }
+          $payload = Get-Content $report.FullName -Raw | ConvertFrom-Json
+          if ($payload.dry_run) { throw "real chain unexpectedly used dry-run" }
+          if ($payload.preset_name -ne "final") { throw "final preset was not used" }
+          if (-not $payload.channel_layout_preserved) { throw "channel layout changed" }
+          if (-not (Test-Path $payload.outputs.clean_wav)) { throw "final WAV is missing" }
+          if (-not (Test-Path $payload.outputs.transcript_mp3)) { throw "final MP3 is missing" }
+          $pair = Join-Path $env:RUNNER_TEMP "ci-pair.json"
+          $source = $sample
+          $processed = $payload.outputs.clean_wav
+          @'
+          import json, sys
+          from pathlib import Path
+          from audio_sound.pair_evaluation import evaluate_audio_pair
+          report = evaluate_audio_pair(
+              source=Path(sys.argv[1]),
+              processed=Path(sys.argv[2]),
+          )
+          Path(sys.argv[3]).write_text(
+              json.dumps(report, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          if report["quality_guard"]["status"] != "PASS":
+              raise SystemExit(1)
+          '@ | & $python - $source $processed $pair

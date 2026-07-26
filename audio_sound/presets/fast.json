@@ -1,0 +1,76 @@
+{
+  "name": "fast",
+  "description": "Fast first pass for batch cleanup when throughput matters more than conservative finishing.",
+  "notes": [
+    "Use for previews, rough dailies, and large spoken-word batches.",
+    "Primary denoise remains enabled, but dynamic processing stays lighter than the safe preset."
+  ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.08,
+        "min_length_ms": 24
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.45,
+        "breath_control_sensitivity": 0.45,
+        "mouth_declick_sensitivity": 0.45
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
+  "extract": {
+    "sample_rate": 48000,
+    "channels": 1,
+    "pcm_codec": "pcm_s16le"
+  },
+  "filters": {
+    "highpass_hz": 70,
+    "lowpass_hz": 14000,
+    "secondary_denoise": {
+      "enabled": true,
+      "nr": 8,
+      "nf": -28,
+      "tracking": true
+    },
+    "gate": {
+      "enabled": false,
+      "threshold": 0.02,
+      "ratio": 2.0,
+      "attack_ms": 15,
+      "release_ms": 180,
+      "makeup_db": 0
+    },
+    "compressor": {
+      "enabled": false,
+      "threshold_db": -18,
+      "ratio": 2.0,
+      "attack_ms": 10,
+      "release_ms": 120,
+      "makeup_db": 1
+    },
+    "loudnorm": {
+      "target_i": -16.8,
+      "target_lra": 7.0,
+      "target_tp": -3.0
+    }
+  },
+  "analysis": {
+    "silence_candidates": false,
+    "silence_threshold_db": -38,
+    "silence_min_duration": 0.12
+  },
+  "transcript_export": {
+    "codec": "libmp3lame",
+    "bitrate": "192k"
+  }
+}

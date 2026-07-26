@@ -35,13 +35,13 @@
 ## 仓库结构
 
 - `.codex/skills/audio-sound/`：仓库级 Codex skill，记录默认处理规则和验收标准。
-- `audio_sound/`：核心 Python 包，包含配置、流程、删词剪辑和 CLI 逻辑。
+- `audio_sound/`：核心 Python 包，包含配置、流程、共享媒体工具、删词剪辑和 CLI 逻辑。
 - `scripts/audio_cleanup.py`：底层清理、检查、安装和维护入口。
 - `scripts/audio_skill_workflow.py`：推荐的最终成品处理入口。
 - `scripts/evaluate_audio_pair.py`：同源前后对比与质量守门回归工具。
 - `audio-verify-delivery`：将最终 WAV/MP3、核心报告、独立同源对比和 SHA-256 绑定为发布验证清单。
 - `scripts/remove_spoken_segments.py`：物理删词、删句、视频同步剪辑入口。
-- `presets/`：处理预设。
+- `presets/`：可编辑处理预设；wheel 同时内置受测试约束的 `audio_sound/presets/` 镜像。
 - `docs/`：架构、调参和参考说明。
 - `tests/`：单元测试。
 - `release/`：仅用于说明发布包位置；正式压缩包放在 GitHub Releases。
@@ -50,7 +50,7 @@
 
 必需：
 
-- Python 3.10+
+- Python 3.10 或 3.11
 - `ffmpeg`
 - `ffprobe`
 
