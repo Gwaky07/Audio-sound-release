@@ -217,3 +217,91 @@ jobs:
           $manifest = Get-Content $verifyOut -Raw | ConvertFrom-Json
           if ($manifest.status -ne "PASS") { throw "audio-verify-delivery smoke failed" }
           if ($manifest.release_blocked) { throw "audio-verify-delivery unexpectedly blocked" }
+
+      - name: Prove the delivery gate actually blocks
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          $python = Join-Path $venv "Scripts\python.exe"
+          $verify = Join-Path $venv "Scripts\audio-verify-delivery.exe"
+          $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
+          $passReport = Join-Path $env:RUNNER_TEMP "ci-verify-report.json"
+          $payload = Get-Content $passReport -Raw | ConvertFrom-Json
+          $wav = $payload.deliverables.wav
+          $mp3 = $payload.deliverables.mp3
+
+          # Each mutation below takes the exact report that just passed and breaks
+          # one thing. A gate that cannot fail is not a gate, so every case must
+          # exit nonzero and set release_blocked.
+          $mutations = @(
+            @{ name = "release_blocked_true"; expect = "report_release_blocked" },
+            @{ name = "release_blocked_absent"; expect = "report_release_blocked" },
+            @{ name = "quality_guard_absent"; expect = "report_release_blocked" },
+            @{ name = "guard_failures_present"; expect = "report_quality_guard_failures" },
+            @{ name = "breath_residual_present"; expect = "report_breath_residuals_present" },
+            @{ name = "pause_mode_invalid"; expect = "report_pause_mode_invalid" },
+            @{ name = "pause_bridge_enabled"; expect = "report_pause_bridge_not_disabled" }
+          )
+
+          foreach ($mutation in $mutations) {
+            $broken = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name).json"
+            $out = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name)-manifest.json"
+            @'
+            import json, sys
+            from pathlib import Path
+            source_report, target, mutation = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+            payload = json.loads(source_report.read_text(encoding="utf-8"))
+            if mutation == "release_blocked_true":
+                payload["quality_guard"]["release_blocked"] = True
+            elif mutation == "release_blocked_absent":
+                payload["quality_guard"].pop("release_blocked", None)
+            elif mutation == "quality_guard_absent":
+                payload.pop("quality_guard", None)
+            elif mutation == "guard_failures_present":
+                payload["quality_guard"]["failures"] = ["spectral_clarity_lost"]
+            elif mutation == "breath_residual_present":
+                payload["breath_cleanup"]["final_residual_windows"] = [[1.0, 1.2]]
+            elif mutation == "pause_mode_invalid":
+                payload["pause_cleanup"]["mode"] = "legacy_hard_gate"
+            elif mutation == "pause_bridge_enabled":
+                payload["pause_cleanup"]["allow_bridge_windows"] = True
+            else:
+                raise SystemExit(f"unknown mutation {mutation}")
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            '@ | & $python - $passReport $broken $mutation.name
+
+            & $verify --source $sample --final-wav $wav --final-mp3 $mp3 `
+              --report $broken --output $out
+            $code = $LASTEXITCODE
+            if ($code -eq 0) {
+              throw "mutation '$($mutation.name)' was NOT blocked (exit 0)"
+            }
+            $result = Get-Content $out -Raw | ConvertFrom-Json
+            if (-not $result.release_blocked) {
+              throw "mutation '$($mutation.name)' left release_blocked false"
+            }
+            if ($result.status -ne "FAIL") {
+              throw "mutation '$($mutation.name)' did not report FAIL"
+            }
+            if ($mutation.expect -notin $result.failures) {
+              throw "mutation '$($mutation.name)' missing expected failure '$($mutation.expect)'; got: $($result.failures -join ',')"
+            }
+            Write-Host "blocked as expected: $($mutation.name) -> $($mutation.expect)"
+          }
+
+      - name: Prove a missing deliverable blocks
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
+          $verify = Join-Path $venv "Scripts\audio-verify-delivery.exe"
+          $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
+          $passReport = Join-Path $env:RUNNER_TEMP "ci-verify-report.json"
+          $out = Join-Path $env:RUNNER_TEMP "ci-missing-manifest.json"
+          $absent = Join-Path $env:RUNNER_TEMP "definitely-not-here.wav"
+          & $verify --source $sample --final-wav $absent --report $passReport --output $out
+          if ($LASTEXITCODE -eq 0) { throw "missing final WAV was not blocked" }
+          $result = Get-Content $out -Raw | ConvertFrom-Json
+          if (-not $result.release_blocked) { throw "missing final WAV left release_blocked false" }
+          Write-Host "blocked as expected: missing final WAV"
