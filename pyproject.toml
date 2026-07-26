@@ -15,6 +15,7 @@ audio-cleanup = "audio_sound.cli:main"
 audio-skill-workflow = "audio_sound.skill_workflow:main"
 audio-remove-segments = "audio_sound.segment_removal:main"
 audio-audit-release = "audio_sound.release_audit:main"
+audio-verify-delivery = "audio_sound.delivery_verifier:main"
 
 [tool.setuptools]
-packages = ["audio_sound"]
+packages = ["audio_sound", "scripts"]

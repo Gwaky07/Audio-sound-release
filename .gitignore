@@ -17,6 +17,7 @@ htmlcov/
 *.jsonl
 dist/
 build/
+*.egg-info/
 output/
 scratch/
 tmp/

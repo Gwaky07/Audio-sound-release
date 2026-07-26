@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-and-package:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test runtime
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -e .
+
+      - name: Run tests
+        shell: pwsh
+        run: python -m pytest -q
+
+      - name: Smoke-test default auto plan
+        shell: pwsh
+        run: audio-skill-workflow run placeholder.wav --mode auto --dry-run
+
+      - name: Build and install from git archive
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "audio-sound.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "audio-sound-archive"
+          git archive --format=zip --output=$archive HEAD
+          Expand-Archive -Path $archive -DestinationPath $extract
+          Push-Location $extract
+          python -m pip install .
+          Pop-Location
+
+      - name: Verify installed imports outside checkout
+        shell: pwsh
+        run: |
+          Push-Location $env:RUNNER_TEMP
+          python -c "import audio_sound.auto_workflow, audio_sound.agent_judgment, audio_sound.skill_workflow, audio_sound.narrow_onset_cleanup, audio_sound.delivery_verifier"
+          audio-skill-workflow run placeholder.wav --mode auto --dry-run
+          Pop-Location
