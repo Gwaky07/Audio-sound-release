@@ -12,13 +12,15 @@ python ../../../scripts/audio_cleanup.py doctor
 python ../../../scripts/audio_skill_workflow.py describe-modes
 ```
 
-## 3. 默认严格成品模式
+## 3. 默认自动优选模式
 
 这是本 skill 的默认最终交付入口：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>"
 ```
+
+等价于 `--mode auto`：先跑 `natural` 基线，再按诊断尝试白名单增强候选；全部硬守门通过才自动交付，否则回退自然版。
 
 最终音频默认只看：
 
@@ -29,16 +31,36 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode refe
 
 如果同名已存在，会自动生成 `_01`、`_02`。中间 wav/mp3 默认清理掉，只保留报告和频谱证据。
 
+报告中的 `input_diagnostics` 说明系统识别到的底噪、削波、动态和候选噪声窗口；`adaptive_profile` 只能是 `baseline`、`leveling_gentle`、`noise_review`、`manual_review`；`breath_cleanup` 记录 Respiro、辅助频谱证据、底噪目标衰减、母带后补处理和最终残留；`quality_guard` 检查声道、采样率、时长、吞字风险、源活跃硬静音、高频清晰度损失、局部相关性、削波增加和短时音量异常。`auto_selection` 还记录 `capability_plan`、`repair_scorecard`、`delivery_incomplete_for_repair_intent`、`model_applied`、`model_succeeded`、`fallback_used`、`benefit_score`、`harm_score`、淘汰原因和回退理由。修音意图下若胜出 `natural_baseline`，`delivery_incomplete_for_repair_intent` 必须为 `true`。`breath_cleanup.status != PASS` 或 `release_blocked=true` 时不应交付。
+
+默认处理会保留源采样率和声道数。双声道只在诊断时临时下混分析，最终 WAV/MP3 仍应为双声道。Codex/GPT 只负责从固定安全白名单中选择和解释，不能直接生成任意 DSP 参数。Respiro 与 DeepFilterNet 只在缺陷证据和 `doctor` 能力满足时作为固定候选运行；门限、硬静音和强降噪仍禁止自动开启。
+
+可选双 ASR 证据：
+
+```bash
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --source-asr source-a.json --source-asr source-b.json --candidate-asr cand-a.json --candidate-asr cand-b.json
+```
+
+清晰度候选和双模型组合缺少可绑定 ASR 证据时只能回退 `natural`；单模型候选无 ASR 时必须通过更严格的衰减、频谱和局部相关性守门。ASR 冲突转人工复核。
+
 如果要排查阶段问题，才保留中间音频：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --keep-intermediate-audio
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --keep-intermediate-audio
 ```
 
-## 4. 更自然的低响度口播模式
+同源前后对比回归：
+
+```bash
+python ../../../scripts/evaluate_audio_pair.py --source "<原音>" --processed "<成品>" --output "../../../scratch/pair-report.json"
+```
+
+## 4. 旧版呼吸清理风格
 
 ```bash
 python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-style
+
+`reference-legacy` 仅用于明确要求复现旧交付或问题对照，不得作为新成品默认模式。
 ```
 
 ## 5. 带局部频谱窗口的运行方式
@@ -46,13 +68,13 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode refe
 当你已经知道要重点看哪些节点时：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --focus-window 节点A,234.8,1.4 --focus-window 节点B,530.3,1.1
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --focus-window 节点A,234.8,1.4 --focus-window 节点B,530.3,1.1
 ```
 
 排查“开头突然多出来声音”和“某个字断开/吞字”时，必须带 focus-window：
 
 ```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-legacy --focus-window start_artifact_1s,0.75,0.9 --focus-window zishi_12s,11.65,1.25
+python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --focus-window start_artifact_1s,0.75,0.9 --focus-window zishi_12s,11.65,1.25
 ```
 
 运行后重点检查：
@@ -118,7 +140,8 @@ workflow_report = next(root.rglob("skill-file-report.json"))
 core = json.loads(core_report.read_text(encoding="utf-8"))
 workflow = json.loads(workflow_report.read_text(encoding="utf-8"))
 files = {
-    "raw_after_respiro_spectra": Path(core["outputs"]["raw_wav"]),
+    "raw_source": Path(core["outputs"]["raw_wav"]),
+    "breath_stage": Path(core["outputs"]["breath_wav"]),
     "deepfilternet": Path(core["outputs"]["denoised_wav"]),
     "mastered": Path(core["outputs"]["clean_wav"]),
     "delivered": Path(workflow["deliverables"]["wav"]),
