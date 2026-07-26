@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from .media_utils import sha256_file
 
 
 DEFAULT_CUT_TOLERANCE_SECONDS = 0.12
@@ -687,26 +688,14 @@ def _hash_media(paths: Sequence[str]) -> list[dict[str, Any]]:
         path = Path(path_value).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Final media not found: {path}")
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
         media.append(
             {
                 "path": str(path),
                 "bytes": path.stat().st_size,
-                "sha256": digest.hexdigest().upper(),
+                "sha256": sha256_file(path, uppercase=True),
             }
         )
     return media
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest().upper()
 
 
 def _bind_final_asr_to_media(
@@ -736,7 +725,10 @@ def _bind_final_asr_to_media(
             if not resolved_media_path.is_file():
                 failure = "declared_media_file_not_found"
             else:
-                media_file_hash = _sha256_file(resolved_media_path)
+                media_file_hash = sha256_file(
+                    resolved_media_path,
+                    uppercase=True,
+                )
                 if observed_hash is not None and observed_hash != media_file_hash:
                     failure = "declared_media_sha256_mismatch"
                 else:

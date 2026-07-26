@@ -17,6 +17,10 @@ from statistics import median
 from typing import Any
 
 from .config import PROJECT_ROOT, resolve_binary, resolve_repo_python
+from .media_utils import (
+    build_mp3_export_command,
+    load_pcm16_wave as _load_wave_samples,
+)
 
 SUPPORTED_MEDIA_EXTENSIONS = {
     ".wav",
@@ -911,6 +915,28 @@ def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _run_recorded_command(
+    command: list[str],
+    executed: list[dict[str, Any]],
+) -> subprocess.CompletedProcess[str]:
+    completed = run_command(command)
+    executed.append(
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or "command failed"
+        )
+    return completed
+
+
 def ffprobe_media(path: Path, ffprobe_bin: str) -> dict[str, Any]:
     ffprobe = ensure_tool(ffprobe_bin)
     cmd = [
@@ -1435,19 +1461,13 @@ def build_ffmpeg_finalize_commands(
 
     return [
         clean_command,
-        [
-            ffmpeg_bin,
-            "-y",
-            "-hide_banner",
-            "-nostdin",
-            "-i",
-            str(clean_wav),
-            "-c:a",
-            transcript["codec"],
-            "-b:a",
-            transcript["bitrate"],
-            str(transcript_mp3),
-        ],
+        build_mp3_export_command(
+            clean_wav,
+            transcript_mp3,
+            ffmpeg_bin=ffmpeg_bin,
+            codec=str(transcript["codec"]),
+            bitrate=str(transcript["bitrate"]),
+        ),
     ]
 
 
@@ -2556,17 +2576,6 @@ def _normalize_noise_windows(noise_windows: list[NoiseWindow] | None) -> list[No
     return list(noise_windows or [])
 
 
-def _load_wave_samples(audio_path: Path) -> tuple[Any, array]:
-    with wave.open(str(audio_path), "rb") as reader:
-        params = reader.getparams()
-        if params.sampwidth != 2 or params.nchannels <= 0:
-            raise ValueError("Expected 16-bit WAV audio with at least one channel")
-        raw_frames = reader.readframes(params.nframes)
-    samples = array("h")
-    samples.frombytes(raw_frames)
-    return params, samples
-
-
 def _downmix_interleaved_samples(samples: array, channels: int) -> array:
     if channels <= 0:
         raise ValueError("channels must be positive")
@@ -2740,6 +2749,521 @@ def repair_deepfilternet_speech_dropouts(
     return repaired, merged_windows
 
 
+def _run_pause_cleanup(
+    *,
+    layout: OutputLayout,
+    active_preset: dict[str, Any],
+    input_analysis: dict[str, Any],
+    runtime: RuntimeOptions,
+    report: dict[str, Any],
+    authorized_cleanup_windows: list[NoiseWindow],
+    commands: list[list[str]],
+    executed: list[dict[str, Any]],
+) -> None:
+    pause_residual_cleanup = active_preset.get("filters", {}).get(
+        "pause_residual_cleanup",
+        {},
+    )
+    if pause_residual_cleanup.get("enabled"):
+        silence_candidates = detect_silence_candidates(
+            layout.clean_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            threshold_db=float(pause_residual_cleanup["silence_threshold_db"]),
+            min_duration=float(pause_residual_cleanup["silence_min_duration"]),
+        )
+        params, samples = _load_wave_samples(layout.clean_wav)
+        total_duration_seconds = (
+            len(samples) / float(params.framerate * max(1, params.nchannels))
+            if params.framerate
+            else 0.0
+        )
+        core_pad_seconds = float(pause_residual_cleanup["core_pad_ms"]) / 1000.0
+        leading_trailing_pad_seconds = (
+            float(
+                pause_residual_cleanup.get(
+                    "leading_trailing_pad_ms",
+                    pause_residual_cleanup["core_pad_ms"],
+                )
+            )
+            / 1000.0
+        )
+        allow_bridge_windows = bool(
+            pause_residual_cleanup.get(
+                "allow_bridge_windows",
+                "silence_floor_dbfs" not in pause_residual_cleanup,
+            )
+        )
+        inferred_pause_windows = infer_pause_residual_cleanup_windows(
+            samples,
+            sample_rate=params.framerate,
+            channels=params.nchannels,
+            silence_candidates=silence_candidates,
+            min_neighbor_silence_duration=float(pause_residual_cleanup["min_neighbor_silence_duration"]),
+            bridge_max_duration=float(pause_residual_cleanup["bridge_max_duration"]),
+            bridge_peak_db=float(pause_residual_cleanup["bridge_peak_db"]),
+            bridge_rms_db=float(pause_residual_cleanup["bridge_rms_db"]),
+            core_pad_seconds=core_pad_seconds,
+            leading_trailing_pad_seconds=leading_trailing_pad_seconds,
+            total_duration_seconds=total_duration_seconds,
+            allow_bridge_windows=allow_bridge_windows,
+        )
+        pause_windows, pause_window_evidence = build_effective_breath_windows(
+            respiro_windows=[],
+            auxiliary_windows=inferred_pause_windows,
+            source_analysis=input_analysis,
+        )
+        # Speech-safe AutoGate floor: confirmed silence cores target absolute silence,
+        # not "slightly below the measured noise floor".
+        if "silence_floor_dbfs" in pause_residual_cleanup:
+            target_dbfs = float(pause_residual_cleanup["silence_floor_dbfs"])
+            pause_mode = "speech_safe_autogate"
+        else:
+            target_dbfs = float(input_analysis["noise_floor_dbfs"]) + float(
+                pause_residual_cleanup["target_margin_db"]
+            )
+            pause_mode = "noise_floor_margin"
+        residual_measure_max_db = max(
+            36.0,
+            float(pause_residual_cleanup["max_attenuation_db"]),
+            float(pause_residual_cleanup["final_pass_max_attenuation_db"]),
+        )
+        cleaned_pause_samples, pause_cleanup_details = (
+            apply_adaptive_breath_cleanup(
+                samples,
+                windows=pause_windows,
+                sample_rate=params.framerate,
+                channels=params.nchannels,
+                max_attenuation_db=float(
+                    pause_residual_cleanup["max_attenuation_db"]
+                ),
+                target_margin_db=float(
+                    pause_residual_cleanup["target_margin_db"]
+                ),
+                context_ms=0.0,
+                fade_ms=float(pause_residual_cleanup["fade_ms"]),
+                target_dbfs_override=target_dbfs,
+            )
+        )
+        report["pause_cleanup"]["mode"] = pause_mode
+        report["pause_cleanup"]["target_dbfs"] = round(target_dbfs, 3)
+        report["pause_cleanup"]["silence_floor_dbfs"] = (
+            float(pause_residual_cleanup["silence_floor_dbfs"])
+            if "silence_floor_dbfs" in pause_residual_cleanup
+            else None
+        )
+        report["pause_cleanup"]["core_pad_ms"] = round(core_pad_seconds * 1000.0, 3)
+        report["pause_cleanup"]["leading_trailing_pad_ms"] = round(
+            leading_trailing_pad_seconds * 1000.0,
+            3,
+        )
+        report["pause_cleanup"]["allow_bridge_windows"] = allow_bridge_windows
+        report["pause_cleanup"]["window_evidence"] = pause_window_evidence
+        report["pause_cleanup"]["first_pass"] = pause_cleanup_details
+        requested_attenuations = [
+            float(detail.get("requested_attenuation_db", 0.0))
+            for detail in pause_cleanup_details
+        ]
+        report["pause_cleanup"]["attenuation_stats"] = {
+            "first_pass_window_count": len(requested_attenuations),
+            "first_pass_max_attenuation_db": (
+                round(max(requested_attenuations), 3) if requested_attenuations else 0.0
+            ),
+            "first_pass_mean_attenuation_db": (
+                round(sum(requested_attenuations) / len(requested_attenuations), 3)
+                if requested_attenuations
+                else 0.0
+            ),
+        }
+        report["pause_residual_cleanup_windows"] = [
+            {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
+            for window in pause_windows
+        ]
+        if cleaned_pause_samples != samples:
+            _write_wave_samples(layout.clean_wav, params, cleaned_pause_samples)
+            authorized_cleanup_windows.extend(pause_windows)
+            transcript_command = commands[-1]
+            _run_recorded_command(transcript_command, executed)
+
+        _, pause_residual_details = apply_adaptive_breath_cleanup(
+            cleaned_pause_samples,
+            windows=pause_windows,
+            sample_rate=params.framerate,
+            channels=params.nchannels,
+            max_attenuation_db=residual_measure_max_db,
+            target_margin_db=float(pause_residual_cleanup["target_margin_db"]),
+            context_ms=0.0,
+            fade_ms=0.0,
+            target_dbfs_override=target_dbfs,
+        )
+        residual_minimum_db = float(
+            pause_residual_cleanup.get("residual_min_excess_db", 3.0)
+        )
+        pause_residual_windows = [
+            {
+                "start_seconds": detail["start_seconds"],
+                "end_seconds": detail["end_seconds"],
+                "remaining_excess_db": detail["requested_attenuation_db"],
+            }
+            for detail in pause_residual_details
+            if float(detail["requested_attenuation_db"]) >= residual_minimum_db
+        ]
+        if pause_residual_windows:
+            residual_noise_windows = [
+                NoiseWindow(
+                    start_seconds=float(item["start_seconds"]),
+                    end_seconds=float(item["end_seconds"]),
+                )
+                for item in pause_residual_windows
+            ]
+            second_pause_samples, second_pause_details = (
+                apply_adaptive_breath_cleanup(
+                    cleaned_pause_samples,
+                    windows=residual_noise_windows,
+                    sample_rate=params.framerate,
+                    channels=params.nchannels,
+                    max_attenuation_db=float(
+                        pause_residual_cleanup[
+                            "second_pass_max_attenuation_db"
+                        ]
+                    ),
+                    target_margin_db=float(
+                        pause_residual_cleanup["target_margin_db"]
+                    ),
+                    context_ms=0.0,
+                    fade_ms=float(pause_residual_cleanup["fade_ms"]) / 2.0,
+                    target_dbfs_override=target_dbfs,
+                )
+            )
+            report["pause_cleanup"]["second_pass"] = second_pause_details
+            if second_pause_samples != cleaned_pause_samples:
+                _write_wave_samples(
+                    layout.clean_wav,
+                    params,
+                    second_pause_samples,
+                )
+                transcript_command = commands[-1]
+                _run_recorded_command(transcript_command, executed)
+            _, pause_residual_details = apply_adaptive_breath_cleanup(
+                second_pause_samples,
+                windows=residual_noise_windows,
+                sample_rate=params.framerate,
+                channels=params.nchannels,
+                max_attenuation_db=residual_measure_max_db,
+                target_margin_db=float(
+                    pause_residual_cleanup["target_margin_db"]
+                ),
+                context_ms=0.0,
+                fade_ms=0.0,
+                target_dbfs_override=target_dbfs,
+            )
+            pause_residual_windows = [
+                {
+                    "start_seconds": detail["start_seconds"],
+                    "end_seconds": detail["end_seconds"],
+                    "remaining_excess_db": detail[
+                        "requested_attenuation_db"
+                    ],
+                }
+                for detail in pause_residual_details
+                if float(detail["requested_attenuation_db"])
+                >= residual_minimum_db
+            ]
+        if pause_residual_windows:
+            final_pause_windows = [
+                NoiseWindow(
+                    start_seconds=float(item["start_seconds"]),
+                    end_seconds=float(item["end_seconds"]),
+                )
+                for item in pause_residual_windows
+            ]
+            final_params, final_samples = _load_wave_samples(
+                layout.clean_wav
+            )
+            final_pause_samples, final_pause_details = (
+                apply_adaptive_breath_cleanup(
+                    final_samples,
+                    windows=final_pause_windows,
+                    sample_rate=final_params.framerate,
+                    channels=final_params.nchannels,
+                    max_attenuation_db=float(
+                        pause_residual_cleanup[
+                            "final_pass_max_attenuation_db"
+                        ]
+                    ),
+                    target_margin_db=float(
+                        pause_residual_cleanup["target_margin_db"]
+                    ),
+                    context_ms=0.0,
+                    fade_ms=float(
+                        pause_residual_cleanup["final_fade_ms"]
+                    ),
+                    target_dbfs_override=target_dbfs,
+                )
+            )
+            report["pause_cleanup"]["final_pass"] = final_pause_details
+            if final_pause_samples != final_samples:
+                _write_wave_samples(
+                    layout.clean_wav,
+                    final_params,
+                    final_pause_samples,
+                )
+                transcript_command = commands[-1]
+                _run_recorded_command(transcript_command, executed)
+            assessment_windows = trim_noise_windows_for_assessment(
+                final_pause_windows,
+                edge_seconds=float(
+                    pause_residual_cleanup[
+                        "residual_assessment_edge_ms"
+                    ]
+                )
+                / 1000.0,
+            )
+            report["pause_cleanup"]["assessment_windows"] = [
+                {
+                    "start_seconds": window.start_seconds,
+                    "end_seconds": window.end_seconds,
+                }
+                for window in assessment_windows
+            ]
+            # Trimmed assessment windows must not create a false PASS: if every
+            # residual core was too short to assess, fail closed with prior evidence.
+            if not assessment_windows:
+                report["pause_cleanup"]["failures"] = [
+                    "confirmed_pause_residual_after_cleanup",
+                    "empty_assessment_windows",
+                ]
+            else:
+                _, pause_residual_details = apply_adaptive_breath_cleanup(
+                    final_pause_samples,
+                    windows=assessment_windows,
+                    sample_rate=final_params.framerate,
+                    channels=final_params.nchannels,
+                    max_attenuation_db=residual_measure_max_db,
+                    target_margin_db=float(
+                        pause_residual_cleanup["target_margin_db"]
+                    ),
+                    context_ms=0.0,
+                    fade_ms=0.0,
+                    target_dbfs_override=target_dbfs,
+                )
+                pause_residual_windows = [
+                    {
+                        "start_seconds": detail["start_seconds"],
+                        "end_seconds": detail["end_seconds"],
+                        "remaining_excess_db": detail[
+                            "requested_attenuation_db"
+                        ],
+                    }
+                    for detail in pause_residual_details
+                    if float(detail["requested_attenuation_db"])
+                    >= residual_minimum_db
+                ]
+        report["pause_cleanup"]["final_residual_windows"] = (
+            pause_residual_windows
+        )
+        pause_failures = list(report["pause_cleanup"].get("failures") or [])
+        if pause_residual_windows and pause_residual_cleanup.get(
+            "block_on_confirmed_residual",
+            True,
+        ):
+            pause_failures.append("confirmed_pause_residual_after_cleanup")
+        if pause_failures:
+            report["pause_cleanup"]["status"] = "FAIL"
+            report["pause_cleanup"]["failures"] = list(dict.fromkeys(pause_failures))
+        else:
+            report["pause_cleanup"]["status"] = "PASS"
+
+
+
+def _run_breath_residual_cleanup(
+    *,
+    breath_windows: list[NoiseWindow],
+    breath_cleanup_policy: dict[str, Any],
+    layout: OutputLayout,
+    runtime: RuntimeOptions,
+    fallback_config: dict[str, Any],
+    input_analysis: dict[str, Any],
+    report: dict[str, Any],
+    commands: list[list[str]],
+    executed: list[dict[str, Any]],
+) -> list[NoiseWindow]:
+    authorized_cleanup_windows = (
+        list(breath_windows) if breath_cleanup_policy.get("enabled") else []
+    )
+    if breath_cleanup_policy.get("enabled") and breath_windows:
+        residual_windows = detect_breath_onset_windows(
+            layout.clean_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            config=fallback_config,
+        )
+        residual_params, residual_samples = _load_wave_samples(layout.clean_wav)
+        residual_windows, residual_spectral_evidence = (
+            filter_noise_like_breath_windows(
+                residual_samples,
+                windows=residual_windows,
+                sample_rate=residual_params.framerate,
+                channels=residual_params.nchannels,
+            )
+        )
+        report["breath_cleanup"]["residual_spectral_evidence"] = (
+            residual_spectral_evidence
+        )
+        second_pass_windows, second_pass_evidence = build_effective_breath_windows(
+            respiro_windows=[],
+            auxiliary_windows=residual_windows,
+            source_analysis=input_analysis,
+        )
+        report["breath_cleanup"]["residual_evidence"] = second_pass_evidence
+        if second_pass_windows:
+            authorized_cleanup_windows.extend(second_pass_windows)
+            clean_params, clean_samples = residual_params, residual_samples
+            second_cleaned, second_pass_details = apply_adaptive_breath_cleanup(
+                clean_samples,
+                windows=second_pass_windows,
+                sample_rate=clean_params.framerate,
+                channels=clean_params.nchannels,
+                max_attenuation_db=float(
+                    breath_cleanup_policy["second_pass_max_attenuation_db"]
+                ),
+                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+                context_ms=float(breath_cleanup_policy["context_ms"]),
+                fade_ms=float(breath_cleanup_policy["fade_ms"]),
+            )
+            report["breath_cleanup"]["second_pass"] = second_pass_details
+            if second_cleaned != clean_samples:
+                _write_wave_samples(layout.clean_wav, clean_params, second_cleaned)
+                transcript_command = commands[-1]
+                _run_recorded_command(transcript_command, executed)
+
+        final_residual_windows = detect_breath_onset_windows(
+            layout.clean_wav,
+            ffmpeg_bin=runtime.ffmpeg_bin,
+            config=fallback_config,
+        )
+        final_params, final_samples = _load_wave_samples(layout.clean_wav)
+        final_residual_windows, final_spectral_evidence = (
+            filter_noise_like_breath_windows(
+                final_samples,
+                windows=final_residual_windows,
+                sample_rate=final_params.framerate,
+                channels=final_params.nchannels,
+            )
+        )
+        report["breath_cleanup"]["final_spectral_evidence"] = (
+            final_spectral_evidence
+        )
+        final_safe_residuals, _ = build_effective_breath_windows(
+            respiro_windows=[],
+            auxiliary_windows=final_residual_windows,
+            source_analysis=input_analysis,
+        )
+        _, final_residual_details = apply_adaptive_breath_cleanup(
+            final_samples,
+            windows=final_safe_residuals,
+            sample_rate=final_params.framerate,
+            channels=final_params.nchannels,
+            max_attenuation_db=36.0,
+            target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+            context_ms=float(breath_cleanup_policy["context_ms"]),
+            fade_ms=0.0,
+        )
+        minimum_excess_db = float(
+            breath_cleanup_policy.get("residual_min_excess_db", 3.0)
+        )
+        confirmed_final_residuals = [
+            window
+            for window, detail in zip(
+                final_safe_residuals,
+                final_residual_details,
+                strict=True,
+            )
+            if float(detail["requested_attenuation_db"]) >= minimum_excess_db
+        ]
+        if (
+            confirmed_final_residuals
+            and int(breath_cleanup_policy.get("max_retries", 1)) >= 2
+        ):
+            authorized_cleanup_windows.extend(confirmed_final_residuals)
+            final_repaired, final_repair_details = apply_adaptive_breath_cleanup(
+                final_samples,
+                windows=confirmed_final_residuals,
+                sample_rate=final_params.framerate,
+                channels=final_params.nchannels,
+                max_attenuation_db=36.0,
+                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+                context_ms=float(breath_cleanup_policy["context_ms"]),
+                fade_ms=float(breath_cleanup_policy["fade_ms"]),
+            )
+            report["breath_cleanup"]["final_repair_pass"] = final_repair_details
+            if final_repaired != final_samples:
+                _write_wave_samples(layout.clean_wav, final_params, final_repaired)
+                transcript_command = commands[-1]
+                _run_recorded_command(transcript_command, executed)
+            final_residual_windows = detect_breath_onset_windows(
+                layout.clean_wav,
+                ffmpeg_bin=runtime.ffmpeg_bin,
+                config=fallback_config,
+            )
+            final_params, final_samples = _load_wave_samples(layout.clean_wav)
+            final_residual_windows, final_retry_spectral_evidence = (
+                filter_noise_like_breath_windows(
+                    final_samples,
+                    windows=final_residual_windows,
+                    sample_rate=final_params.framerate,
+                    channels=final_params.nchannels,
+                )
+            )
+            report["breath_cleanup"]["final_retry_spectral_evidence"] = (
+                final_retry_spectral_evidence
+            )
+            final_safe_residuals, _ = build_effective_breath_windows(
+                respiro_windows=[],
+                auxiliary_windows=final_residual_windows,
+                source_analysis=input_analysis,
+            )
+            _, final_residual_details = apply_adaptive_breath_cleanup(
+                final_samples,
+                windows=final_safe_residuals,
+                sample_rate=final_params.framerate,
+                channels=final_params.nchannels,
+                max_attenuation_db=36.0,
+                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
+                context_ms=float(breath_cleanup_policy["context_ms"]),
+                fade_ms=0.0,
+            )
+            confirmed_final_residuals = [
+                window
+                for window, detail in zip(
+                    final_safe_residuals,
+                    final_residual_details,
+                    strict=True,
+                )
+                if float(detail["requested_attenuation_db"]) >= minimum_excess_db
+            ]
+        report["breath_cleanup"]["final_residual_assessment"] = (
+            final_residual_details
+        )
+        report["breath_cleanup"]["final_residual_windows"] = [
+            {
+                "start_seconds": window.start_seconds,
+                "end_seconds": window.end_seconds,
+            }
+            for window in confirmed_final_residuals
+        ]
+        if confirmed_final_residuals and breath_cleanup_policy.get(
+            "block_on_confirmed_residual",
+            True,
+        ):
+            report["breath_cleanup"]["status"] = "FAIL"
+            report["breath_cleanup"]["failures"] = [
+                "confirmed_breath_residual_after_retry"
+            ]
+        else:
+            report["breath_cleanup"]["status"] = "PASS"
+
+    return authorized_cleanup_windows
+
+
 def process_media_file(
     input_file: Path,
     *,
@@ -2773,10 +3297,7 @@ def process_media_file(
     apply_deepfilternet = deepfilternet_enabled and not skip_deepfilternet
 
     ffmpeg = runtime.ffmpeg_bin if runtime.dry_run else ensure_tool(runtime.ffmpeg_bin)
-    python_bin = runtime.python_executable or resolve_repo_python(
-        PROJECT_ROOT,
-        require_venv=True,
-    )
+    python_bin = runtime.python_executable or resolve_repo_python(PROJECT_ROOT)
     if not runtime.dry_run:
         python_bin = ensure_tool(python_bin)
 
@@ -2926,17 +3447,7 @@ def process_media_file(
     executed: list[dict[str, Any]] = []
 
     extract_command = commands[0]
-    completed = run_command(extract_command)
-    executed.append(
-        {
-            "command": extract_command,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout.strip(),
-            "stderr": completed.stderr.strip(),
-        }
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "command failed")
+    _run_recorded_command(extract_command, executed)
 
     raw_params, raw_samples = _load_wave_samples(layout.raw_wav)
     input_mono = _analysis_samples(raw_params, raw_samples)
@@ -3135,17 +3646,7 @@ def process_media_file(
 
     if apply_deepfilternet:
         deepfilter_command = commands[1]
-        completed = run_command(deepfilter_command)
-        executed.append(
-            {
-                "command": deepfilter_command,
-                "returncode": completed.returncode,
-                "stdout": completed.stdout.strip(),
-                "stderr": completed.stderr.strip(),
-            }
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "command failed")
+        _run_recorded_command(deepfilter_command, executed)
 
         detected_df_wav = _find_single_wav(layout.deepfilternet_dir)
         if detected_df_wav.resolve() != layout.denoised_wav.resolve():
@@ -3175,220 +3676,20 @@ def process_media_file(
         report["deepfilternet_dropout_repair_windows"] = []
         remaining_commands = commands[1:]
     for command in remaining_commands:
-        completed = run_command(command)
-        executed.append(
-            {
-                "command": command,
-                "returncode": completed.returncode,
-                "stdout": completed.stdout.strip(),
-                "stderr": completed.stderr.strip(),
-            }
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "command failed")
+        _run_recorded_command(command, executed)
     loudnorm_execution = executed[-2]
 
-    authorized_cleanup_windows = (
-        list(breath_windows) if breath_cleanup_policy.get("enabled") else []
+    authorized_cleanup_windows = _run_breath_residual_cleanup(
+        breath_windows=breath_windows,
+        breath_cleanup_policy=breath_cleanup_policy,
+        layout=layout,
+        runtime=runtime,
+        fallback_config=fallback_config,
+        input_analysis=input_analysis,
+        report=report,
+        commands=commands,
+        executed=executed,
     )
-    if breath_cleanup_policy.get("enabled") and breath_windows:
-        residual_windows = detect_breath_onset_windows(
-            layout.clean_wav,
-            ffmpeg_bin=runtime.ffmpeg_bin,
-            config=fallback_config,
-        )
-        residual_params, residual_samples = _load_wave_samples(layout.clean_wav)
-        residual_windows, residual_spectral_evidence = (
-            filter_noise_like_breath_windows(
-                residual_samples,
-                windows=residual_windows,
-                sample_rate=residual_params.framerate,
-                channels=residual_params.nchannels,
-            )
-        )
-        report["breath_cleanup"]["residual_spectral_evidence"] = (
-            residual_spectral_evidence
-        )
-        second_pass_windows, second_pass_evidence = build_effective_breath_windows(
-            respiro_windows=[],
-            auxiliary_windows=residual_windows,
-            source_analysis=input_analysis,
-        )
-        report["breath_cleanup"]["residual_evidence"] = second_pass_evidence
-        if second_pass_windows:
-            authorized_cleanup_windows.extend(second_pass_windows)
-            clean_params, clean_samples = residual_params, residual_samples
-            second_cleaned, second_pass_details = apply_adaptive_breath_cleanup(
-                clean_samples,
-                windows=second_pass_windows,
-                sample_rate=clean_params.framerate,
-                channels=clean_params.nchannels,
-                max_attenuation_db=float(
-                    breath_cleanup_policy["second_pass_max_attenuation_db"]
-                ),
-                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
-                context_ms=float(breath_cleanup_policy["context_ms"]),
-                fade_ms=float(breath_cleanup_policy["fade_ms"]),
-            )
-            report["breath_cleanup"]["second_pass"] = second_pass_details
-            if second_cleaned != clean_samples:
-                _write_wave_samples(layout.clean_wav, clean_params, second_cleaned)
-                transcript_command = commands[-1]
-                completed = run_command(transcript_command)
-                executed.append(
-                    {
-                        "command": transcript_command,
-                        "returncode": completed.returncode,
-                        "stdout": completed.stdout.strip(),
-                        "stderr": completed.stderr.strip(),
-                    }
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(
-                        completed.stderr.strip()
-                        or completed.stdout.strip()
-                        or "command failed"
-                    )
-
-        final_residual_windows = detect_breath_onset_windows(
-            layout.clean_wav,
-            ffmpeg_bin=runtime.ffmpeg_bin,
-            config=fallback_config,
-        )
-        final_params, final_samples = _load_wave_samples(layout.clean_wav)
-        final_residual_windows, final_spectral_evidence = (
-            filter_noise_like_breath_windows(
-                final_samples,
-                windows=final_residual_windows,
-                sample_rate=final_params.framerate,
-                channels=final_params.nchannels,
-            )
-        )
-        report["breath_cleanup"]["final_spectral_evidence"] = (
-            final_spectral_evidence
-        )
-        final_safe_residuals, _ = build_effective_breath_windows(
-            respiro_windows=[],
-            auxiliary_windows=final_residual_windows,
-            source_analysis=input_analysis,
-        )
-        _, final_residual_details = apply_adaptive_breath_cleanup(
-            final_samples,
-            windows=final_safe_residuals,
-            sample_rate=final_params.framerate,
-            channels=final_params.nchannels,
-            max_attenuation_db=36.0,
-            target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
-            context_ms=float(breath_cleanup_policy["context_ms"]),
-            fade_ms=0.0,
-        )
-        minimum_excess_db = float(
-            breath_cleanup_policy.get("residual_min_excess_db", 3.0)
-        )
-        confirmed_final_residuals = [
-            window
-            for window, detail in zip(
-                final_safe_residuals,
-                final_residual_details,
-                strict=True,
-            )
-            if float(detail["requested_attenuation_db"]) >= minimum_excess_db
-        ]
-        if (
-            confirmed_final_residuals
-            and int(breath_cleanup_policy.get("max_retries", 1)) >= 2
-        ):
-            authorized_cleanup_windows.extend(confirmed_final_residuals)
-            final_repaired, final_repair_details = apply_adaptive_breath_cleanup(
-                final_samples,
-                windows=confirmed_final_residuals,
-                sample_rate=final_params.framerate,
-                channels=final_params.nchannels,
-                max_attenuation_db=36.0,
-                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
-                context_ms=float(breath_cleanup_policy["context_ms"]),
-                fade_ms=float(breath_cleanup_policy["fade_ms"]),
-            )
-            report["breath_cleanup"]["final_repair_pass"] = final_repair_details
-            if final_repaired != final_samples:
-                _write_wave_samples(layout.clean_wav, final_params, final_repaired)
-                transcript_command = commands[-1]
-                completed = run_command(transcript_command)
-                executed.append(
-                    {
-                        "command": transcript_command,
-                        "returncode": completed.returncode,
-                        "stdout": completed.stdout.strip(),
-                        "stderr": completed.stderr.strip(),
-                    }
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(
-                        completed.stderr.strip()
-                        or completed.stdout.strip()
-                        or "command failed"
-                    )
-            final_residual_windows = detect_breath_onset_windows(
-                layout.clean_wav,
-                ffmpeg_bin=runtime.ffmpeg_bin,
-                config=fallback_config,
-            )
-            final_params, final_samples = _load_wave_samples(layout.clean_wav)
-            final_residual_windows, final_retry_spectral_evidence = (
-                filter_noise_like_breath_windows(
-                    final_samples,
-                    windows=final_residual_windows,
-                    sample_rate=final_params.framerate,
-                    channels=final_params.nchannels,
-                )
-            )
-            report["breath_cleanup"]["final_retry_spectral_evidence"] = (
-                final_retry_spectral_evidence
-            )
-            final_safe_residuals, _ = build_effective_breath_windows(
-                respiro_windows=[],
-                auxiliary_windows=final_residual_windows,
-                source_analysis=input_analysis,
-            )
-            _, final_residual_details = apply_adaptive_breath_cleanup(
-                final_samples,
-                windows=final_safe_residuals,
-                sample_rate=final_params.framerate,
-                channels=final_params.nchannels,
-                max_attenuation_db=36.0,
-                target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
-                context_ms=float(breath_cleanup_policy["context_ms"]),
-                fade_ms=0.0,
-            )
-            confirmed_final_residuals = [
-                window
-                for window, detail in zip(
-                    final_safe_residuals,
-                    final_residual_details,
-                    strict=True,
-                )
-                if float(detail["requested_attenuation_db"]) >= minimum_excess_db
-            ]
-        report["breath_cleanup"]["final_residual_assessment"] = (
-            final_residual_details
-        )
-        report["breath_cleanup"]["final_residual_windows"] = [
-            {
-                "start_seconds": window.start_seconds,
-                "end_seconds": window.end_seconds,
-            }
-            for window in confirmed_final_residuals
-        ]
-        if confirmed_final_residuals and breath_cleanup_policy.get(
-            "block_on_confirmed_residual",
-            True,
-        ):
-            report["breath_cleanup"]["status"] = "FAIL"
-            report["breath_cleanup"]["failures"] = [
-                "confirmed_breath_residual_after_retry"
-            ]
-        else:
-            report["breath_cleanup"]["status"] = "PASS"
 
     breath_onset_cleanup = preset.get("filters", {}).get("breath_onset_cleanup", {})
     if breath_onset_cleanup.get("enabled"):
@@ -3411,360 +3712,16 @@ def process_media_file(
     else:
         report["postprocess_breath_onset_windows"] = []
 
-    pause_residual_cleanup = active_preset.get("filters", {}).get(
-        "pause_residual_cleanup",
-        {},
+    _run_pause_cleanup(
+        layout=layout,
+        active_preset=active_preset,
+        input_analysis=input_analysis,
+        runtime=runtime,
+        report=report,
+        authorized_cleanup_windows=authorized_cleanup_windows,
+        commands=commands,
+        executed=executed,
     )
-    if pause_residual_cleanup.get("enabled"):
-        silence_candidates = detect_silence_candidates(
-            layout.clean_wav,
-            ffmpeg_bin=runtime.ffmpeg_bin,
-            threshold_db=float(pause_residual_cleanup["silence_threshold_db"]),
-            min_duration=float(pause_residual_cleanup["silence_min_duration"]),
-        )
-        params, samples = _load_wave_samples(layout.clean_wav)
-        total_duration_seconds = (
-            len(samples) / float(params.framerate * max(1, params.nchannels))
-            if params.framerate
-            else 0.0
-        )
-        core_pad_seconds = float(pause_residual_cleanup["core_pad_ms"]) / 1000.0
-        leading_trailing_pad_seconds = (
-            float(
-                pause_residual_cleanup.get(
-                    "leading_trailing_pad_ms",
-                    pause_residual_cleanup["core_pad_ms"],
-                )
-            )
-            / 1000.0
-        )
-        allow_bridge_windows = bool(
-            pause_residual_cleanup.get(
-                "allow_bridge_windows",
-                "silence_floor_dbfs" not in pause_residual_cleanup,
-            )
-        )
-        inferred_pause_windows = infer_pause_residual_cleanup_windows(
-            samples,
-            sample_rate=params.framerate,
-            channels=params.nchannels,
-            silence_candidates=silence_candidates,
-            min_neighbor_silence_duration=float(pause_residual_cleanup["min_neighbor_silence_duration"]),
-            bridge_max_duration=float(pause_residual_cleanup["bridge_max_duration"]),
-            bridge_peak_db=float(pause_residual_cleanup["bridge_peak_db"]),
-            bridge_rms_db=float(pause_residual_cleanup["bridge_rms_db"]),
-            core_pad_seconds=core_pad_seconds,
-            leading_trailing_pad_seconds=leading_trailing_pad_seconds,
-            total_duration_seconds=total_duration_seconds,
-            allow_bridge_windows=allow_bridge_windows,
-        )
-        pause_windows, pause_window_evidence = build_effective_breath_windows(
-            respiro_windows=[],
-            auxiliary_windows=inferred_pause_windows,
-            source_analysis=input_analysis,
-        )
-        # Speech-safe AutoGate floor: confirmed silence cores target absolute silence,
-        # not "slightly below the measured noise floor".
-        if "silence_floor_dbfs" in pause_residual_cleanup:
-            target_dbfs = float(pause_residual_cleanup["silence_floor_dbfs"])
-            pause_mode = "speech_safe_autogate"
-        else:
-            target_dbfs = float(input_analysis["noise_floor_dbfs"]) + float(
-                pause_residual_cleanup["target_margin_db"]
-            )
-            pause_mode = "noise_floor_margin"
-        residual_measure_max_db = max(
-            36.0,
-            float(pause_residual_cleanup["max_attenuation_db"]),
-            float(pause_residual_cleanup["final_pass_max_attenuation_db"]),
-        )
-        cleaned_pause_samples, pause_cleanup_details = (
-            apply_adaptive_breath_cleanup(
-                samples,
-                windows=pause_windows,
-                sample_rate=params.framerate,
-                channels=params.nchannels,
-                max_attenuation_db=float(
-                    pause_residual_cleanup["max_attenuation_db"]
-                ),
-                target_margin_db=float(
-                    pause_residual_cleanup["target_margin_db"]
-                ),
-                context_ms=0.0,
-                fade_ms=float(pause_residual_cleanup["fade_ms"]),
-                target_dbfs_override=target_dbfs,
-            )
-        )
-        report["pause_cleanup"]["mode"] = pause_mode
-        report["pause_cleanup"]["target_dbfs"] = round(target_dbfs, 3)
-        report["pause_cleanup"]["silence_floor_dbfs"] = (
-            float(pause_residual_cleanup["silence_floor_dbfs"])
-            if "silence_floor_dbfs" in pause_residual_cleanup
-            else None
-        )
-        report["pause_cleanup"]["core_pad_ms"] = round(core_pad_seconds * 1000.0, 3)
-        report["pause_cleanup"]["leading_trailing_pad_ms"] = round(
-            leading_trailing_pad_seconds * 1000.0,
-            3,
-        )
-        report["pause_cleanup"]["allow_bridge_windows"] = allow_bridge_windows
-        report["pause_cleanup"]["window_evidence"] = pause_window_evidence
-        report["pause_cleanup"]["first_pass"] = pause_cleanup_details
-        requested_attenuations = [
-            float(detail.get("requested_attenuation_db", 0.0))
-            for detail in pause_cleanup_details
-        ]
-        report["pause_cleanup"]["attenuation_stats"] = {
-            "first_pass_window_count": len(requested_attenuations),
-            "first_pass_max_attenuation_db": (
-                round(max(requested_attenuations), 3) if requested_attenuations else 0.0
-            ),
-            "first_pass_mean_attenuation_db": (
-                round(sum(requested_attenuations) / len(requested_attenuations), 3)
-                if requested_attenuations
-                else 0.0
-            ),
-        }
-        report["pause_residual_cleanup_windows"] = [
-            {"start_seconds": window.start_seconds, "end_seconds": window.end_seconds}
-            for window in pause_windows
-        ]
-        if cleaned_pause_samples != samples:
-            _write_wave_samples(layout.clean_wav, params, cleaned_pause_samples)
-            authorized_cleanup_windows.extend(pause_windows)
-            transcript_command = commands[-1]
-            completed = run_command(transcript_command)
-            executed.append(
-                {
-                    "command": transcript_command,
-                    "returncode": completed.returncode,
-                    "stdout": completed.stdout.strip(),
-                    "stderr": completed.stderr.strip(),
-                }
-            )
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    completed.stderr.strip()
-                    or completed.stdout.strip()
-                    or "command failed"
-                )
-
-        _, pause_residual_details = apply_adaptive_breath_cleanup(
-            cleaned_pause_samples,
-            windows=pause_windows,
-            sample_rate=params.framerate,
-            channels=params.nchannels,
-            max_attenuation_db=residual_measure_max_db,
-            target_margin_db=float(pause_residual_cleanup["target_margin_db"]),
-            context_ms=0.0,
-            fade_ms=0.0,
-            target_dbfs_override=target_dbfs,
-        )
-        residual_minimum_db = float(
-            pause_residual_cleanup.get("residual_min_excess_db", 3.0)
-        )
-        pause_residual_windows = [
-            {
-                "start_seconds": detail["start_seconds"],
-                "end_seconds": detail["end_seconds"],
-                "remaining_excess_db": detail["requested_attenuation_db"],
-            }
-            for detail in pause_residual_details
-            if float(detail["requested_attenuation_db"]) >= residual_minimum_db
-        ]
-        if pause_residual_windows:
-            residual_noise_windows = [
-                NoiseWindow(
-                    start_seconds=float(item["start_seconds"]),
-                    end_seconds=float(item["end_seconds"]),
-                )
-                for item in pause_residual_windows
-            ]
-            second_pause_samples, second_pause_details = (
-                apply_adaptive_breath_cleanup(
-                    cleaned_pause_samples,
-                    windows=residual_noise_windows,
-                    sample_rate=params.framerate,
-                    channels=params.nchannels,
-                    max_attenuation_db=float(
-                        pause_residual_cleanup[
-                            "second_pass_max_attenuation_db"
-                        ]
-                    ),
-                    target_margin_db=float(
-                        pause_residual_cleanup["target_margin_db"]
-                    ),
-                    context_ms=0.0,
-                    fade_ms=float(pause_residual_cleanup["fade_ms"]) / 2.0,
-                    target_dbfs_override=target_dbfs,
-                )
-            )
-            report["pause_cleanup"]["second_pass"] = second_pause_details
-            if second_pause_samples != cleaned_pause_samples:
-                _write_wave_samples(
-                    layout.clean_wav,
-                    params,
-                    second_pause_samples,
-                )
-                transcript_command = commands[-1]
-                completed = run_command(transcript_command)
-                executed.append(
-                    {
-                        "command": transcript_command,
-                        "returncode": completed.returncode,
-                        "stdout": completed.stdout.strip(),
-                        "stderr": completed.stderr.strip(),
-                    }
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(
-                        completed.stderr.strip()
-                        or completed.stdout.strip()
-                        or "command failed"
-                    )
-            _, pause_residual_details = apply_adaptive_breath_cleanup(
-                second_pause_samples,
-                windows=residual_noise_windows,
-                sample_rate=params.framerate,
-                channels=params.nchannels,
-                max_attenuation_db=residual_measure_max_db,
-                target_margin_db=float(
-                    pause_residual_cleanup["target_margin_db"]
-                ),
-                context_ms=0.0,
-                fade_ms=0.0,
-                target_dbfs_override=target_dbfs,
-            )
-            pause_residual_windows = [
-                {
-                    "start_seconds": detail["start_seconds"],
-                    "end_seconds": detail["end_seconds"],
-                    "remaining_excess_db": detail[
-                        "requested_attenuation_db"
-                    ],
-                }
-                for detail in pause_residual_details
-                if float(detail["requested_attenuation_db"])
-                >= residual_minimum_db
-            ]
-        if pause_residual_windows:
-            final_pause_windows = [
-                NoiseWindow(
-                    start_seconds=float(item["start_seconds"]),
-                    end_seconds=float(item["end_seconds"]),
-                )
-                for item in pause_residual_windows
-            ]
-            final_params, final_samples = _load_wave_samples(
-                layout.clean_wav
-            )
-            final_pause_samples, final_pause_details = (
-                apply_adaptive_breath_cleanup(
-                    final_samples,
-                    windows=final_pause_windows,
-                    sample_rate=final_params.framerate,
-                    channels=final_params.nchannels,
-                    max_attenuation_db=float(
-                        pause_residual_cleanup[
-                            "final_pass_max_attenuation_db"
-                        ]
-                    ),
-                    target_margin_db=float(
-                        pause_residual_cleanup["target_margin_db"]
-                    ),
-                    context_ms=0.0,
-                    fade_ms=float(
-                        pause_residual_cleanup["final_fade_ms"]
-                    ),
-                    target_dbfs_override=target_dbfs,
-                )
-            )
-            report["pause_cleanup"]["final_pass"] = final_pause_details
-            if final_pause_samples != final_samples:
-                _write_wave_samples(
-                    layout.clean_wav,
-                    final_params,
-                    final_pause_samples,
-                )
-                transcript_command = commands[-1]
-                completed = run_command(transcript_command)
-                executed.append(
-                    {
-                        "command": transcript_command,
-                        "returncode": completed.returncode,
-                        "stdout": completed.stdout.strip(),
-                        "stderr": completed.stderr.strip(),
-                    }
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(
-                        completed.stderr.strip()
-                        or completed.stdout.strip()
-                        or "command failed"
-                    )
-            assessment_windows = trim_noise_windows_for_assessment(
-                final_pause_windows,
-                edge_seconds=float(
-                    pause_residual_cleanup[
-                        "residual_assessment_edge_ms"
-                    ]
-                )
-                / 1000.0,
-            )
-            report["pause_cleanup"]["assessment_windows"] = [
-                {
-                    "start_seconds": window.start_seconds,
-                    "end_seconds": window.end_seconds,
-                }
-                for window in assessment_windows
-            ]
-            # Trimmed assessment windows must not create a false PASS: if every
-            # residual core was too short to assess, fail closed with prior evidence.
-            if not assessment_windows:
-                report["pause_cleanup"]["failures"] = [
-                    "confirmed_pause_residual_after_cleanup",
-                    "empty_assessment_windows",
-                ]
-            else:
-                _, pause_residual_details = apply_adaptive_breath_cleanup(
-                    final_pause_samples,
-                    windows=assessment_windows,
-                    sample_rate=final_params.framerate,
-                    channels=final_params.nchannels,
-                    max_attenuation_db=residual_measure_max_db,
-                    target_margin_db=float(
-                        pause_residual_cleanup["target_margin_db"]
-                    ),
-                    context_ms=0.0,
-                    fade_ms=0.0,
-                    target_dbfs_override=target_dbfs,
-                )
-                pause_residual_windows = [
-                    {
-                        "start_seconds": detail["start_seconds"],
-                        "end_seconds": detail["end_seconds"],
-                        "remaining_excess_db": detail[
-                            "requested_attenuation_db"
-                        ],
-                    }
-                    for detail in pause_residual_details
-                    if float(detail["requested_attenuation_db"])
-                    >= residual_minimum_db
-                ]
-        report["pause_cleanup"]["final_residual_windows"] = (
-            pause_residual_windows
-        )
-        pause_failures = list(report["pause_cleanup"].get("failures") or [])
-        if pause_residual_windows and pause_residual_cleanup.get(
-            "block_on_confirmed_residual",
-            True,
-        ):
-            pause_failures.append("confirmed_pause_residual_after_cleanup")
-        if pause_failures:
-            report["pause_cleanup"]["status"] = "FAIL"
-            report["pause_cleanup"]["failures"] = list(dict.fromkeys(pause_failures))
-        else:
-            report["pause_cleanup"]["status"] = "PASS"
 
     report["executed"] = executed
     report["loudnorm_summary"] = extract_loudnorm_summary(loudnorm_execution["stderr"])

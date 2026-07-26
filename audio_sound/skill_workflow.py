@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import io
 import json
 import re
 import shutil
-import wave
-from array import array
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .config import PROJECT_ROOT, resolve_repo_python
+from .media_utils import (
+    export_mp3,
+    format_seconds as _format_seconds,
+    load_pcm16_wave as _load_wave_samples,
+    sha256_file,
+)
 from .pipeline import (
     NoiseWindow,
     _analysis_samples,
@@ -299,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--ffprobe-bin", default="ffprobe")
     run_parser.add_argument(
         "--python-executable",
-        default=resolve_repo_python(PROJECT_ROOT, require_venv=True),
+        default=resolve_repo_python(PROJECT_ROOT),
     )
     run_parser.add_argument(
         "--focus-window",
@@ -1520,14 +1523,6 @@ def _run_cleanup_candidate(
     return core_report, stdout_buffer.getvalue(), stderr_buffer.getvalue()
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest().upper()
-
-
 def _run_auto_skill_workflow(
     *,
     input_path: Path,
@@ -1695,7 +1690,9 @@ def _run_auto_skill_workflow(
                 source_asr_payloads=source_asr_payloads,
                 candidate_asr_payloads=candidate_asr_payloads,
                 expected_media_sha256=(
-                    _sha256_file(clean_wav) if clean_wav.exists() else None
+                    sha256_file(clean_wav, uppercase=True)
+                    if clean_wav.exists()
+                    else None
                 ),
                 recipe=AUTO_CANDIDATE_RECIPES.get(spec.candidate_id, {}),
                 applied_stages=list(core_report.get("processing_steps") or []),
@@ -1734,8 +1731,9 @@ def _run_auto_skill_workflow(
                     quality_guard=combined_guard,
                     source_asr_payloads=source_asr_payloads,
                     candidate_asr_payloads=candidate_asr_payloads,
-                    expected_media_sha256=_sha256_file(
-                        Path(combined_report["outputs"]["clean_wav"])
+                    expected_media_sha256=sha256_file(
+                        Path(combined_report["outputs"]["clean_wav"]),
+                        uppercase=True,
                     ),
                     recipe=AUTO_CANDIDATE_RECIPES["model_combined_review"],
                     applied_stages=list(combined_report.get("processing_steps") or []),
@@ -2051,28 +2049,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     raise ValueError(f"Unhandled command: {args.command}")
 
 
-def _export_mp3_from_wav(source_wav: Path, output_mp3: Path, *, ffmpeg_bin: str) -> None:
-    ffmpeg = ensure_tool(ffmpeg_bin)
-    output_mp3.parent.mkdir(parents=True, exist_ok=True)
-    completed = run_command(
-        [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-nostdin",
-            "-i",
-            str(source_wav),
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "192k",
-            str(output_mp3),
-        ]
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "mp3 export failed")
-
-
 def _authorized_cleanup_windows(core_report: Mapping[str, Any]) -> list[NoiseWindow]:
     breath_cleanup = core_report.get("breath_cleanup") or {}
     items = [
@@ -2241,7 +2217,12 @@ def _finalize_workflow_file(
         failures = ", ".join(final_delivery_guard.get("failures", [])) or "unknown preservation failure"
         raise RuntimeError(f"final delivery guard blocked {input_file.name}: {failures}")
     shutil.copy2(delivered_wav, final_wav)
-    _export_mp3_from_wav(final_wav, final_mp3, ffmpeg_bin=ffmpeg_bin)
+    export_mp3(
+        final_wav,
+        final_mp3,
+        ffmpeg_bin=ffmpeg_bin,
+        bitrate="192k",
+    )
     delivered_wav = final_wav
     delivered_mp3 = final_mp3
 
@@ -2442,7 +2423,12 @@ def _finalize_reference_legacy_file(
         failures = ", ".join(final_delivery_guard.get("failures", [])) or "unknown preservation failure"
         raise RuntimeError(f"final delivery guard blocked {input_file.name}: {failures}")
     shutil.copy2(delivered_wav, final_wav)
-    _export_mp3_from_wav(final_wav, final_mp3, ffmpeg_bin=ffmpeg_bin)
+    export_mp3(
+        final_wav,
+        final_mp3,
+        ffmpeg_bin=ffmpeg_bin,
+        bitrate="192k",
+    )
     delivered_wav = final_wav
     delivered_mp3 = final_mp3
 
@@ -2675,17 +2661,6 @@ def _render_file_workflow_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _load_wave_samples(audio_path: Path) -> tuple[Any, array]:
-    with wave.open(str(audio_path), "rb") as reader:
-        params = reader.getparams()
-        if params.sampwidth != 2 or params.nchannels <= 0:
-            raise ValueError("Expected 16-bit WAV audio with at least one channel")
-        raw_frames = reader.readframes(params.nframes)
-    samples = array("h")
-    samples.frombytes(raw_frames)
-    return params, samples
-
-
 def _parse_single_float(pattern: re.Pattern[str], text: str) -> float | None:
     match = pattern.search(text)
     if not match:
@@ -2698,10 +2673,6 @@ def _write_json_report(report_path: Path, payload: dict[str, Any]) -> None:
         json.dumps(payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-
-
-def _format_seconds(value: float) -> str:
-    return f"{value:.3f}".rstrip("0").rstrip(".")
 
 
 def _window_suffix(start_seconds: float, duration_seconds: float) -> str:

@@ -1,21 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
 
+from .media_utils import sha256_file
 from .pair_evaluation import evaluate_audio_pair
 from .pipeline import ffprobe_media
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _require_file(path: Path, label: str, failures: list[str]) -> None:
@@ -252,23 +244,23 @@ def verify_delivery(
     artifacts: dict[str, Any] = {
         "source": {
             "path": str(source.resolve()),
-            "sha256": _sha256_file(source),
+            "sha256": sha256_file(source),
             "metadata": source_meta,
         },
         "final_wav": {
             "path": str(final_wav.resolve()),
-            "sha256": _sha256_file(final_wav),
+            "sha256": sha256_file(final_wav),
             "metadata": wav_meta,
         },
         "report_json": {
             "path": str(report_json.resolve()),
-            "sha256": _sha256_file(report_json),
+            "sha256": sha256_file(report_json),
         },
     }
     if final_mp3 is not None:
         artifacts["final_mp3"] = {
             "path": str(final_mp3.resolve()),
-            "sha256": _sha256_file(final_mp3),
+            "sha256": sha256_file(final_mp3),
             "metadata": mp3_meta,
         }
 
