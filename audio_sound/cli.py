@@ -97,7 +97,10 @@ def _add_clean_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--enable-silence-report", action="store_true")
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     parser.add_argument("--ffprobe-bin", default="ffprobe")
-    parser.add_argument("--python-executable", default=resolve_repo_python(PROJECT_ROOT))
+    parser.add_argument(
+        "--python-executable",
+        default=resolve_repo_python(PROJECT_ROOT, require_venv=True),
+    )
     parser.add_argument("--dry-run", action="store_true")
 
 
@@ -120,6 +123,7 @@ def command_inspect(input_path: str, ffprobe_bin: str) -> int:
 
 def command_doctor(args: argparse.Namespace) -> int:
     payload = detect_runtime(
+        repo_root=PROJECT_ROOT,
         python_executable=args.python_executable,
         ffmpeg_bin=args.ffmpeg_bin,
         ffprobe_bin=args.ffprobe_bin,

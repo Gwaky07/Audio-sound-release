@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import re
@@ -10,11 +11,14 @@ from array import array
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .config import PROJECT_ROOT, resolve_repo_python
 from .pipeline import (
     NoiseWindow,
+    _analysis_samples,
+    analyze_pcm16_samples,
+    compare_audio_preservation,
     detect_silence_candidates,
     duck_audio_file_in_place,
     ensure_tool,
@@ -116,6 +120,76 @@ class WorkflowMode:
 
 
 WORKFLOW_MODES: dict[str, WorkflowMode] = {
+    "auto": WorkflowMode(
+        name="auto",
+        preset_name="natural",
+        attenuation_db=0.0,
+        target_lufs=None,
+        suffix="自动优选版",
+        apply_narrow_cleanup=False,
+        apply_bridge_cleanup=False,
+        description="Best-repair auto delivery: prefer the final repair chain, optionally compete model-safe candidates, and treat natural only as an incomplete fallback when enhancement fails gates.",
+    ),
+    "natural": WorkflowMode(
+        name="natural",
+        preset_name="natural",
+        attenuation_db=0.0,
+        target_lufs=None,
+        suffix="自然清晰版",
+        apply_narrow_cleanup=False,
+        apply_bridge_cleanup=False,
+        description="Natural-first delivery: protect articulation, apply conservative leveling, and require verified local repairs.",
+    ),
+    "clarity-leveling-safe": WorkflowMode(
+        name="clarity-leveling-safe",
+        preset_name="clarity-leveling-safe",
+        attenuation_db=0.0,
+        target_lufs=None,
+        suffix="清晰度稳量版",
+        apply_narrow_cleanup=False,
+        apply_bridge_cleanup=False,
+        description="Whitelist auto candidate: clarity EQ and gentle leveling without low-pass, gate, hard mute, or model denoise.",
+    ),
+    "noise-cleanup-safe": WorkflowMode(
+        name="noise-cleanup-safe",
+        preset_name="noise-cleanup-safe",
+        attenuation_db=0.0,
+        target_lufs=None,
+        suffix="保守降噪版",
+        apply_narrow_cleanup=False,
+        apply_bridge_cleanup=False,
+        description="Whitelist auto candidate: conservative same-file noise-window cleanup without DeepFilterNet or whole-file breath models.",
+    ),
+    "respiro-breath-safe": WorkflowMode(
+        name="respiro-breath-safe",
+        preset_name="respiro-breath-safe",
+        attenuation_db=3.0,
+        target_lufs=None,
+        suffix="呼吸安全候选版",
+        apply_narrow_cleanup=False,
+        apply_bridge_cleanup=False,
+        description="Model candidate: real Respiro detection with bounded local ducking and no hard mute.",
+    ),
+    "deepfilter-denoise-safe": WorkflowMode(
+        name="deepfilter-denoise-safe",
+        preset_name="deepfilter-denoise-safe",
+        attenuation_db=0.0,
+        target_lufs=None,
+        suffix="模型降噪候选版",
+        apply_narrow_cleanup=False,
+        apply_bridge_cleanup=False,
+        description="Model candidate: DeepFilterNet with post-filter disabled and strict preservation guards.",
+    ),
+    "model-combined-review": WorkflowMode(
+        name="model-combined-review",
+        preset_name="model-combined-review",
+        attenuation_db=3.0,
+        target_lufs=None,
+        suffix="双模型审核版",
+        apply_narrow_cleanup=False,
+        apply_bridge_cleanup=False,
+        description="Combined model candidate generated only after both single-model candidates pass and dual ASR is available.",
+    ),
     "reference-style": WorkflowMode(
         name="reference-style",
         preset_name="fast",
@@ -139,12 +213,12 @@ WORKFLOW_MODES: dict[str, WorkflowMode] = {
     "final": WorkflowMode(
         name="final",
         preset_name="final",
-        attenuation_db=18.0,
+        attenuation_db=3.0,
         target_lufs=None,
-        suffix="技能交付版",
+        suffix="增强修音终版",
         apply_narrow_cleanup=False,
         apply_bridge_cleanup=False,
-        description="Balanced final-delivery spoken-word cleanup with lighter post-silence surgery.",
+        description="Audible but bounded final cleanup with local breath attenuation, evidence-gated denoise, restrained clarity EQ, de-essing, and voice leveling.",
     ),
     "repair-soft": WorkflowMode(
         name="repair-soft",
@@ -197,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run the stable repository workflow.")
     run_parser.add_argument("input_path")
-    run_parser.add_argument("--mode", default="reference-legacy", choices=sorted(WORKFLOW_MODES))
+    run_parser.add_argument("--mode", default="auto", choices=sorted(WORKFLOW_MODES))
     run_parser.add_argument("--output-dir")
     run_parser.add_argument(
         "--delivery-dir",
@@ -214,11 +288,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep internal WAV/MP3 stage files for troubleshooting.",
     )
     run_parser.add_argument("--recursive", action="store_true")
+    run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate mode imports and print the fixed execution plan without processing media.",
+    )
     run_parser.add_argument("--target-lufs", type=float)
     run_parser.add_argument("--attenuation-db", type=float)
     run_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     run_parser.add_argument("--ffprobe-bin", default="ffprobe")
-    run_parser.add_argument("--python-executable", default=resolve_repo_python(PROJECT_ROOT))
+    run_parser.add_argument(
+        "--python-executable",
+        default=resolve_repo_python(PROJECT_ROOT, require_venv=True),
+    )
     run_parser.add_argument(
         "--focus-window",
         action="append",
@@ -247,6 +329,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--skip-bridge-cleanup", action="store_true")
     run_parser.add_argument("--spectrogram-start", type=float, default=0.0)
     run_parser.add_argument("--spectrogram-duration", type=float, default=30.0)
+    run_parser.add_argument(
+        "--source-asr",
+        action="append",
+        default=[],
+        help="Optional source ASR JSON for auto-mode articulation gating. Repeatable.",
+    )
+    run_parser.add_argument(
+        "--candidate-asr",
+        action="append",
+        default=[],
+        help="Optional candidate ASR JSON for auto-mode articulation gating. Repeatable.",
+    )
 
     describe_parser = subparsers.add_parser("describe-modes", help="Print workflow modes as JSON.")
     describe_parser.add_argument("--mode", choices=sorted(WORKFLOW_MODES))
@@ -936,7 +1030,7 @@ def apply_narrow_cleanup_to_file(
     ffmpeg_bin: str,
     config: Any | None = None,
 ) -> dict[str, Any]:
-    from scripts.narrow_onset_cleanup import (
+    from .narrow_onset_cleanup import (
         NarrowConfig,
         _build_detection_windows,
         _load_samples,
@@ -960,7 +1054,7 @@ def apply_narrow_cleanup_to_file(
         ffmpeg_bin=ffmpeg_bin,
         config=config,
     )
-    samples, sample_rate = _load_samples(input_wav)
+    samples, sample_rate, _ = _load_samples(input_wav)
     narrow_windows, refined_items = _narrow_windows(
         raw_windows,
         low_threshold_silences=low_silences,
@@ -1026,7 +1120,7 @@ def apply_narrow_cleanup_to_file(
 
 
 def _legacy_reference_preview_a_config() -> Any:
-    from scripts.narrow_onset_cleanup import NarrowConfig
+    from .narrow_onset_cleanup import NarrowConfig
 
     return NarrowConfig(
         low_threshold_db=-52.0,
@@ -1046,7 +1140,7 @@ def _legacy_reference_preview_a_config() -> Any:
 
 
 def _legacy_reference_preview_b_config() -> Any:
-    from scripts.narrow_onset_cleanup import NarrowConfig
+    from .narrow_onset_cleanup import NarrowConfig
 
     return NarrowConfig(
         low_threshold_db=-50.0,
@@ -1066,7 +1160,7 @@ def _legacy_reference_preview_b_config() -> Any:
 
 
 def _legacy_reference_extreme_config() -> Any:
-    from scripts.narrow_onset_cleanup import NarrowConfig
+    from .narrow_onset_cleanup import NarrowConfig
 
     return NarrowConfig(
         low_threshold_db=-48.0,
@@ -1120,11 +1214,30 @@ def _legacy_reference_bridge_config() -> BridgeCleanupConfig:
 
 
 def _processing_order_for_mode(mode: WorkflowMode) -> list[str]:
+    if mode.name == "auto":
+        return [
+            "Input source overview and diagnostics",
+            "Natural baseline candidate",
+            "Whitelist enhancement candidates from diagnostics",
+            "Format, swallow, spectral, and optional ASR gates",
+            "Select highest safe score or fall back to natural",
+            "Transcript-ready export and spectrogram artifacts",
+        ]
+    if mode.name in {"natural", "clarity-leveling-safe", "noise-cleanup-safe"}:
+        return [
+            "Input source overview",
+            "Speech-safe high-pass filtering",
+            "Gentle peak control and optional clarity EQ",
+            "Integrated loudness normalization",
+            "Optional verified exact-window repair",
+            "Transcript-ready export and spectrogram artifacts",
+        ]
+
     steps = [
         "Input source overview",
         "Respiro-en breath detection",
-        "SpectraMini-style breath control and mouth de-click",
-        "DeepFilterNet primary denoise",
+        "SpectraMini-style breath control; mouth de-click only when explicitly enabled",
+        "Optional evidence-gated DeepFilterNet primary denoise",
         "FFmpeg mastering and loudnorm",
     ]
     if mode.name == "reference-legacy":
@@ -1171,10 +1284,84 @@ def run_skill_workflow(
     keep_intermediate_audio: bool,
     spectrogram_start: float,
     spectrogram_duration: float,
+    source_asr_payloads: Sequence[dict[str, Any]] | None = None,
+    candidate_asr_payloads: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    mode = resolve_mode(mode_name)
+    if mode.name == "auto":
+        return _run_auto_skill_workflow(
+            input_path=input_path,
+            output_dir=output_dir,
+            recursive=recursive,
+            target_lufs_override=target_lufs_override,
+            attenuation_db_override=attenuation_db_override,
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            python_executable=python_executable,
+            noise_windows=noise_windows,
+            focus_windows=focus_windows,
+            exact_mute_windows=exact_mute_windows,
+            exact_duck_windows=exact_duck_windows,
+            skip_spectrograms=skip_spectrograms,
+            skip_bridge_cleanup=skip_bridge_cleanup,
+            delivery_dir=delivery_dir,
+            delivery_prefix=delivery_prefix,
+            keep_intermediate_audio=keep_intermediate_audio,
+            spectrogram_start=spectrogram_start,
+            spectrogram_duration=spectrogram_duration,
+            source_asr_payloads=source_asr_payloads,
+            candidate_asr_payloads=candidate_asr_payloads,
+        )
+
+    return _run_single_mode_skill_workflow(
+        input_path=input_path,
+        mode=mode,
+        output_dir=output_dir,
+        recursive=recursive,
+        target_lufs_override=target_lufs_override,
+        attenuation_db_override=attenuation_db_override,
+        ffmpeg_bin=ffmpeg_bin,
+        ffprobe_bin=ffprobe_bin,
+        python_executable=python_executable,
+        noise_windows=noise_windows,
+        focus_windows=focus_windows,
+        exact_mute_windows=exact_mute_windows,
+        exact_duck_windows=exact_duck_windows,
+        skip_spectrograms=skip_spectrograms,
+        skip_bridge_cleanup=skip_bridge_cleanup,
+        delivery_dir=delivery_dir,
+        delivery_prefix=delivery_prefix,
+        keep_intermediate_audio=keep_intermediate_audio,
+        spectrogram_start=spectrogram_start,
+        spectrogram_duration=spectrogram_duration,
+    )
+
+
+def _run_single_mode_skill_workflow(
+    *,
+    input_path: Path,
+    mode: WorkflowMode,
+    output_dir: Path | None,
+    recursive: bool,
+    target_lufs_override: float | None,
+    attenuation_db_override: float | None,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    python_executable: str,
+    noise_windows: Sequence[str],
+    focus_windows: Sequence[FocusWindow],
+    exact_mute_windows: Sequence[NoiseWindow],
+    exact_duck_windows: Sequence[ExactDuckWindow],
+    skip_spectrograms: bool,
+    skip_bridge_cleanup: bool,
+    delivery_dir: Path | None,
+    delivery_prefix: str,
+    keep_intermediate_audio: bool,
+    spectrogram_start: float,
+    spectrogram_duration: float,
 ) -> dict[str, Any]:
     from .cli import main as audio_cleanup_main
 
-    mode = resolve_mode(mode_name)
     run_slug = utc_timestamp_slug()
     workflow_root = (
         output_dir
@@ -1277,6 +1464,398 @@ def run_skill_workflow(
     return summary
 
 
+def _run_cleanup_candidate(
+    *,
+    input_path: Path,
+    preset_name: str,
+    output_dir: Path,
+    attenuation_db: float,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    python_executable: str,
+    noise_windows: Sequence[str],
+    target_lufs: float | None,
+    recursive: bool,
+) -> tuple[dict[str, Any], str, str]:
+    from .cli import main as audio_cleanup_main
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cli_args = [
+        "clean",
+        str(input_path),
+        "--preset",
+        preset_name,
+        "--output-dir",
+        str(output_dir),
+        "--attenuation-db",
+        str(attenuation_db),
+        "--ffmpeg-bin",
+        ffmpeg_bin,
+        "--ffprobe-bin",
+        ffprobe_bin,
+        "--python-executable",
+        python_executable,
+    ]
+    if target_lufs is not None:
+        cli_args.extend(["--target-lufs", str(target_lufs)])
+    if recursive:
+        cli_args.append("--recursive")
+    for noise_window in noise_windows:
+        cli_args.extend(["--noise-window", noise_window])
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+        exit_code = audio_cleanup_main(cli_args)
+    if exit_code != 0:
+        details = "\n".join(
+            part.strip()
+            for part in (stdout_buffer.getvalue(), stderr_buffer.getvalue())
+            if part.strip()
+        )
+        raise RuntimeError(f"auto candidate {preset_name} failed with exit code {exit_code}\n{details}")
+    batch_summary = json.loads((output_dir / "batch-summary.json").read_text(encoding="utf-8"))
+    if not batch_summary.get("reports"):
+        raise RuntimeError(f"auto candidate {preset_name} produced no reports")
+    core_report = json.loads(Path(batch_summary["reports"][0]["report_json"]).read_text(encoding="utf-8"))
+    return core_report, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def _run_auto_skill_workflow(
+    *,
+    input_path: Path,
+    output_dir: Path | None,
+    recursive: bool,
+    target_lufs_override: float | None,
+    attenuation_db_override: float | None,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    python_executable: str,
+    noise_windows: Sequence[str],
+    focus_windows: Sequence[FocusWindow],
+    exact_mute_windows: Sequence[NoiseWindow],
+    exact_duck_windows: Sequence[ExactDuckWindow],
+    skip_spectrograms: bool,
+    skip_bridge_cleanup: bool,
+    delivery_dir: Path | None,
+    delivery_prefix: str,
+    keep_intermediate_audio: bool,
+    spectrogram_start: float,
+    spectrogram_duration: float,
+    source_asr_payloads: Sequence[dict[str, Any]] | None = None,
+    candidate_asr_payloads: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    from .agent_judgment import (
+        build_capability_plan,
+        build_repair_scorecard,
+        delivery_completeness,
+    )
+    from .auto_workflow import (
+        AUTO_CANDIDATE_RECIPES,
+        build_candidate_specs,
+        build_evaluated_candidate,
+        select_auto_candidate,
+    )
+    from .bootstrap import detect_runtime
+
+    repair_intent = True
+    auto_mode = resolve_mode("auto")
+    run_slug = utc_timestamp_slug()
+    workflow_root = (
+        output_dir
+        if output_dir is not None
+        else PROJECT_ROOT / "output" / f"skill-{run_slug}_{_slug_label(input_path.stem or input_path.name)}"
+    )
+    workflow_root.mkdir(parents=True, exist_ok=True)
+    resolved_delivery_dir = delivery_dir if delivery_dir is not None else PROJECT_ROOT / "output" / "修音成品"
+    resolved_delivery_dir.mkdir(parents=True, exist_ok=True)
+    candidates_root = workflow_root / "auto_candidates"
+    candidates_root.mkdir(parents=True, exist_ok=True)
+
+    baseline_report, baseline_stdout, baseline_stderr = _run_cleanup_candidate(
+        input_path=input_path,
+        preset_name="natural",
+        output_dir=candidates_root / "natural_baseline",
+        attenuation_db=attenuation_db_override if attenuation_db_override is not None else 0.0,
+        ffmpeg_bin=ffmpeg_bin,
+        ffprobe_bin=ffprobe_bin,
+        python_executable=python_executable,
+        noise_windows=noise_windows,
+        target_lufs=target_lufs_override,
+        recursive=recursive,
+    )
+    diagnostics = baseline_report.get("input_diagnostics") or {}
+    runtime_capabilities = detect_runtime(
+        repo_root=PROJECT_ROOT,
+        python_executable=python_executable,
+        ffmpeg_bin=ffmpeg_bin,
+        ffprobe_bin=ffprobe_bin,
+    )
+    capability_plan = build_capability_plan(
+        diagnostics,
+        runtime_capabilities=runtime_capabilities,
+        confirmed_mouth_noise=bool(exact_mute_windows or exact_duck_windows),
+    )
+    specs = build_candidate_specs(
+        diagnostics,
+        runtime_capabilities=runtime_capabilities,
+        repair_intent=repair_intent,
+    )
+    evaluated: list[dict[str, Any]] = []
+    stdout_chunks = [baseline_stdout]
+    stderr_chunks = [baseline_stderr]
+
+    for spec in specs:
+        if spec.unavailable_reason:
+            evaluated.append(
+                build_evaluated_candidate(
+                    candidate_id=spec.candidate_id,
+                    requires_asr=spec.requires_asr,
+                    quality_guard={
+                        "status": "UNAVAILABLE",
+                        "failures": [spec.unavailable_reason],
+                        "release_blocked": True,
+                    },
+                    recipe=AUTO_CANDIDATE_RECIPES.get(spec.candidate_id, {}),
+                    core_report={
+                        "runtime_capabilities": runtime_capabilities,
+                        "stage_status": {},
+                    },
+                )
+            )
+            continue
+        if spec.candidate_id == "natural_baseline":
+            core_report = baseline_report
+        else:
+            candidate_noise = list(spec.noise_windows) if spec.noise_windows else list(noise_windows)
+            try:
+                core_report, candidate_stdout, candidate_stderr = _run_cleanup_candidate(
+                    input_path=input_path,
+                    preset_name=spec.preset_name,
+                    output_dir=candidates_root / spec.candidate_id,
+                    attenuation_db=(
+                        3.0
+                        if spec.candidate_id
+                        in {"respiro_breath_safe", "final_repair_best"}
+                        else attenuation_db_override
+                        if attenuation_db_override is not None
+                        else 0.0
+                    ),
+                    ffmpeg_bin=ffmpeg_bin,
+                    ffprobe_bin=ffprobe_bin,
+                    python_executable=python_executable,
+                    noise_windows=candidate_noise,
+                    target_lufs=target_lufs_override,
+                    recursive=recursive,
+                )
+            except (RuntimeError, OSError) as error:
+                evaluated.append(
+                    build_evaluated_candidate(
+                        candidate_id=spec.candidate_id,
+                        requires_asr=spec.requires_asr,
+                        quality_guard={
+                            "status": "FAIL",
+                            "failures": ["candidate_execution_failed"],
+                            "release_blocked": True,
+                        },
+                        recipe=AUTO_CANDIDATE_RECIPES.get(spec.candidate_id, {}),
+                        core_report={"error": str(error), "stage_status": {}},
+                    )
+                )
+                continue
+            stdout_chunks.append(candidate_stdout)
+            stderr_chunks.append(candidate_stderr)
+
+        quality_guard = dict(core_report.get("quality_guard") or {})
+        raw_wav = Path(core_report["outputs"]["raw_wav"])
+        clean_wav = Path(core_report["outputs"]["clean_wav"])
+        if (
+            raw_wav.exists()
+            and clean_wav.exists()
+            and not AUTO_CANDIDATE_RECIPES.get(spec.candidate_id, {}).get("model_candidate")
+        ):
+            quality_guard = _build_final_delivery_guard(
+                raw_wav,
+                clean_wav,
+                excluded_windows=_authorized_cleanup_windows(core_report),
+            )
+
+        evaluated.append(
+            build_evaluated_candidate(
+                candidate_id=spec.candidate_id,
+                requires_asr=spec.requires_asr,
+                quality_guard=quality_guard,
+                source_asr_payloads=source_asr_payloads,
+                candidate_asr_payloads=candidate_asr_payloads,
+                expected_media_sha256=(
+                    _sha256_file(clean_wav) if clean_wav.exists() else None
+                ),
+                recipe=AUTO_CANDIDATE_RECIPES.get(spec.candidate_id, {}),
+                applied_stages=list(core_report.get("processing_steps") or []),
+                core_report=core_report,
+            )
+        )
+
+    passed_single_models = {
+        str(item.get("candidate_id"))
+        for item in evaluated
+        if item.get("candidate_id") in {"respiro_breath_safe", "deepfilter_denoise_safe"}
+        and not (item.get("quality_guard") or {}).get("release_blocked")
+        and not (item.get("asr_guard") or {}).get("release_blocked")
+    }
+    if passed_single_models == {"respiro_breath_safe", "deepfilter_denoise_safe"}:
+        try:
+            combined_report, combined_stdout, combined_stderr = _run_cleanup_candidate(
+                input_path=input_path,
+                preset_name="model-combined-review",
+                output_dir=candidates_root / "model_combined_review",
+                attenuation_db=3.0,
+                ffmpeg_bin=ffmpeg_bin,
+                ffprobe_bin=ffprobe_bin,
+                python_executable=python_executable,
+                noise_windows=list(noise_windows),
+                target_lufs=target_lufs_override,
+                recursive=recursive,
+            )
+            stdout_chunks.append(combined_stdout)
+            stderr_chunks.append(combined_stderr)
+            combined_guard = dict(combined_report.get("quality_guard") or {})
+            evaluated.append(
+                build_evaluated_candidate(
+                    candidate_id="model_combined_review",
+                    requires_asr=True,
+                    quality_guard=combined_guard,
+                    source_asr_payloads=source_asr_payloads,
+                    candidate_asr_payloads=candidate_asr_payloads,
+                    expected_media_sha256=_sha256_file(
+                        Path(combined_report["outputs"]["clean_wav"])
+                    ),
+                    recipe=AUTO_CANDIDATE_RECIPES["model_combined_review"],
+                    applied_stages=list(combined_report.get("processing_steps") or []),
+                    core_report=combined_report,
+                )
+            )
+        except (RuntimeError, OSError) as error:
+            evaluated.append(
+                build_evaluated_candidate(
+                    candidate_id="model_combined_review",
+                    requires_asr=True,
+                    quality_guard={
+                        "status": "FAIL",
+                        "failures": ["candidate_execution_failed"],
+                        "release_blocked": True,
+                    },
+                    recipe=AUTO_CANDIDATE_RECIPES["model_combined_review"],
+                    core_report={"error": str(error), "stage_status": {}},
+                )
+            )
+
+    selected = select_auto_candidate(evaluated, repair_intent=repair_intent)
+    winner_mode_name = str(
+        AUTO_CANDIDATE_RECIPES.get(str(selected["candidate_id"]), {}).get("workflow_mode", "natural")
+    )
+    winner_mode = resolve_mode(winner_mode_name if winner_mode_name in WORKFLOW_MODES else "natural")
+    winner_report = selected.get("core_report") or baseline_report
+    completeness = delivery_completeness(
+        candidate_id=str(selected["candidate_id"]),
+        repair_intent=repair_intent,
+    )
+    repair_scorecard = build_repair_scorecard(
+        core_report=winner_report,
+        quality_guard=selected.get("quality_guard") or {},
+        capability_plan=capability_plan,
+        candidate_id=str(selected["candidate_id"]),
+    )
+    finalized = _finalize_workflow_file(
+        core_report=winner_report,
+        mode=winner_mode,
+        ffmpeg_bin=ffmpeg_bin,
+        reference_target_lufs=target_lufs_override if target_lufs_override is not None else -19.0,
+        focus_windows=focus_windows,
+        exact_mute_windows=exact_mute_windows,
+        exact_duck_windows=exact_duck_windows,
+        skip_spectrograms=skip_spectrograms,
+        skip_bridge_cleanup=True,
+        delivery_dir=resolved_delivery_dir,
+        delivery_prefix=delivery_prefix,
+        spectrogram_start=spectrogram_start,
+        spectrogram_duration=spectrogram_duration,
+        run_slug=run_slug,
+    )
+    finalized["auto_selection"] = {
+        "candidate_id": selected["candidate_id"],
+        "selection_reason": selected["selection_reason"],
+        "score": selected.get("score"),
+        "rejected_candidates": selected.get("rejected_candidates", []),
+        "manual_review_required": selected.get("manual_review_required", False),
+        "quality_guard": selected.get("quality_guard"),
+        "asr_guard": selected.get("asr_guard"),
+        "recipe": selected.get("recipe"),
+        "applied_stages": selected.get("applied_stages"),
+        "runtime_capabilities": runtime_capabilities,
+        "model_applied": selected.get("model_applied", False),
+        "model_succeeded": selected.get("model_succeeded", False),
+        "fallback_used": selected.get("fallback_used", False),
+        "benefit_score": selected.get("benefit_score", 0.0),
+        "harm_score": selected.get("harm_score", 0.0),
+        "benefit_metrics": selected.get("benefit_metrics", {}),
+        "capability_plan": capability_plan,
+        "repair_scorecard": repair_scorecard,
+        **completeness,
+    }
+    summary = {
+        "mode": asdict(auto_mode),
+        "workflow_root": str(workflow_root),
+        "delivery_dir": str(resolved_delivery_dir),
+        "input_path": str(input_path),
+        "recursive": recursive,
+        "intermediate_audio_retained": keep_intermediate_audio,
+        "lower_level_stdout": "\n".join(chunk for chunk in stdout_chunks if chunk),
+        "lower_level_stderr": "\n".join(chunk for chunk in stderr_chunks if chunk),
+        "processing_order": _processing_order_for_mode(auto_mode),
+        "files": [finalized],
+        "auto_candidates": evaluated,
+        "auto_selection": finalized["auto_selection"],
+        "capability_plan": capability_plan,
+        "repair_scorecard": repair_scorecard,
+        "delivery_incomplete_for_repair_intent": completeness[
+            "delivery_incomplete_for_repair_intent"
+        ],
+        "core_batch_summary": {
+            "reports": [
+                {
+                    "candidate_id": item["candidate_id"],
+                    "report_json": (item.get("core_report") or {})
+                    .get("outputs", {})
+                    .get("report_json"),
+                }
+                for item in evaluated
+            ]
+        },
+    }
+    if keep_intermediate_audio:
+        summary["intermediate_audio_removed"] = []
+    else:
+        summary["intermediate_audio_removed"] = _prune_intermediate_audio([finalized])
+
+    (workflow_root / "skill-workflow-summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (workflow_root / "skill-workflow-summary.md").write_text(
+        render_skill_workflow_markdown(summary),
+        encoding="utf-8",
+    )
+    return summary
+
+
 def render_skill_workflow_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# Repo Local Audio Skill Workflow",
@@ -1291,6 +1870,50 @@ def render_skill_workflow_markdown(summary: dict[str, Any]) -> str:
         "## Processing Order",
     ]
     lines.extend(f"- {step}" for step in summary["processing_order"])
+    auto_selection = summary.get("auto_selection")
+    if auto_selection:
+        lines.extend(
+            [
+                "",
+                "## Auto Selection",
+                f"- Winner: `{auto_selection.get('candidate_id')}`",
+                f"- Reason: `{auto_selection.get('selection_reason')}`",
+                f"- Score: `{auto_selection.get('score')}`",
+                f"- Model applied: `{auto_selection.get('model_applied')}`",
+                f"- Model succeeded: `{auto_selection.get('model_succeeded')}`",
+                f"- Fallback used: `{auto_selection.get('fallback_used')}`",
+                f"- Benefit score: `{auto_selection.get('benefit_score')}`",
+                f"- Harm score: `{auto_selection.get('harm_score')}`",
+                f"- Manual review required: `{auto_selection.get('manual_review_required')}`",
+                f"- Repair intent incomplete: `{auto_selection.get('delivery_incomplete_for_repair_intent')}`",
+                f"- Repair scorecard: `{((auto_selection.get('repair_scorecard') or {}).get('status'))}`",
+            ]
+        )
+        for rejected in auto_selection.get("rejected_candidates") or []:
+            lines.append(
+                f"- Rejected `{rejected.get('candidate_id')}`: {', '.join(rejected.get('failures') or [])}"
+            )
+        capability_plan = auto_selection.get("capability_plan") or summary.get(
+            "capability_plan"
+        )
+        if capability_plan:
+            lines.extend(["", "## Capability Plan"])
+            for name, item in (capability_plan.get("capabilities") or {}).items():
+                lines.append(
+                    f"- `{name}`: needed=`{item.get('needed')}`"
+                    + (
+                        f", skip=`{item.get('skipped_reason')}`"
+                        if item.get("skipped_reason")
+                        else ""
+                    )
+                )
+        scorecard = auto_selection.get("repair_scorecard") or summary.get(
+            "repair_scorecard"
+        )
+        if scorecard:
+            lines.extend(["", "## Repair Scorecard"])
+            for name, item in (scorecard.get("items") or {}).items():
+                lines.append(f"- `{name}`: `{item.get('status')}`")
     lines.append("")
     lines.append("## Files")
     for item in summary["files"]:
@@ -1310,7 +1933,58 @@ def command_describe_modes(mode_name: str | None) -> int:
     return 0
 
 
+def build_workflow_dry_run(input_path: Path, mode_name: str) -> dict[str, Any]:
+    mode = WORKFLOW_MODES[mode_name]
+    payload: dict[str, Any] = {
+        "dry_run": True,
+        "input_path": str(input_path),
+        "mode": mode_name,
+        "preset_name": mode.preset_name,
+        "delivery_required": True,
+    }
+    if mode_name != "auto":
+        payload["candidate_ids"] = []
+        return payload
+
+    from .agent_judgment import build_capability_plan
+    from .auto_workflow import build_candidate_specs
+
+    representative_diagnostics = {
+        "stationary_noise": False,
+        "estimated_snr_db": 40.0,
+        "pause_ratio": 0.15,
+        "candidate_noise_windows": [],
+    }
+    capability_plan = build_capability_plan(representative_diagnostics)
+    specs = build_candidate_specs(
+        representative_diagnostics,
+        runtime_capabilities={},
+        repair_intent=True,
+    )
+    candidate_ids = [spec.candidate_id for spec in specs]
+    required_candidates = {"natural_baseline", "final_repair_best"}
+    missing = sorted(required_candidates.difference(candidate_ids))
+    if missing:
+        raise RuntimeError(
+            f"auto dry-run is missing required candidates: {', '.join(missing)}"
+        )
+    payload["candidate_ids"] = candidate_ids
+    payload["capability_plan"] = capability_plan
+    return payload
+
+
 def command_run(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(
+            json.dumps(
+                build_workflow_dry_run(Path(args.input_path), args.mode),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    source_asr_payloads = [_load_asr_payload(Path(path)) for path in args.source_asr]
+    candidate_asr_payloads = [_load_asr_payload(Path(path)) for path in args.candidate_asr]
     summary = run_skill_workflow(
         input_path=Path(args.input_path),
         mode_name=args.mode,
@@ -1332,14 +2006,39 @@ def command_run(args: argparse.Namespace) -> int:
         keep_intermediate_audio=args.keep_intermediate_audio,
         spectrogram_start=args.spectrogram_start,
         spectrogram_duration=args.spectrogram_duration,
+        source_asr_payloads=source_asr_payloads or None,
+        candidate_asr_payloads=candidate_asr_payloads or None,
     )
     print(f"Workflow root: {summary['workflow_root']}")
     print(f"Final delivery dir: {summary['delivery_dir']}")
+    if summary.get("auto_selection"):
+        selection = summary["auto_selection"]
+        print(
+            f"Auto selection: {selection.get('candidate_id')} "
+            f"({selection.get('selection_reason')}, score={selection.get('score')})"
+        )
+        if selection.get("delivery_incomplete_for_repair_intent"):
+            print(
+                "WARNING: repair intent incomplete — natural baseline is fallback only, "
+                "not a finished best-repair delivery."
+            )
+        scorecard = selection.get("repair_scorecard") or {}
+        if scorecard:
+            print(f"Repair scorecard: {scorecard.get('status')}")
     for item in summary["files"]:
         print(f"- {item['input_file']} -> {item['deliverables']['wav']}")
     if not summary["intermediate_audio_retained"]:
         print(f"Removed intermediate audio files: {len(summary['intermediate_audio_removed'])}")
     return 0
+
+
+def _load_asr_payload(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"ASR payload must be a JSON object: {path}")
+    if "engine" not in payload:
+        payload = {**payload, "engine": path.stem}
+    return payload
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1374,6 +2073,66 @@ def _export_mp3_from_wav(source_wav: Path, output_mp3: Path, *, ffmpeg_bin: str)
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "mp3 export failed")
 
 
+def _authorized_cleanup_windows(core_report: Mapping[str, Any]) -> list[NoiseWindow]:
+    breath_cleanup = core_report.get("breath_cleanup") or {}
+    items = [
+        *(core_report.get("breath_onset_windows") or []),
+        *(breath_cleanup.get("second_pass") or []),
+        *(breath_cleanup.get("final_repair_pass") or []),
+        *(core_report.get("pause_residual_cleanup_windows") or []),
+    ]
+    return [
+        NoiseWindow(
+            start_seconds=float(item["start_seconds"]),
+            end_seconds=float(item["end_seconds"]),
+        )
+        for item in items
+        if float(item.get("end_seconds", 0.0))
+        > float(item.get("start_seconds", 0.0))
+    ]
+
+
+def _build_final_delivery_guard(
+    reference_wav: Path,
+    delivered_wav: Path,
+    *,
+    excluded_windows: Sequence[NoiseWindow] = (),
+) -> dict[str, Any]:
+    reference_params, reference_samples = _load_wave_samples(reference_wav)
+    delivered_params, delivered_samples = _load_wave_samples(delivered_wav)
+    reference_mono = _analysis_samples(reference_params, reference_samples)
+    delivered_mono = _analysis_samples(delivered_params, delivered_samples)
+    reference_analysis = analyze_pcm16_samples(
+        reference_mono,
+        sample_rate=reference_params.framerate,
+        frame_ms=10.0,
+    )
+    delivered_analysis = analyze_pcm16_samples(
+        delivered_mono,
+        sample_rate=delivered_params.framerate,
+        frame_ms=10.0,
+    )
+    return {
+        "evidence_level": "DIRECTLY VERIFIED",
+        **compare_audio_preservation(
+            reference_analysis,
+            delivered_analysis,
+            reference_format={
+                "sample_rate": reference_params.framerate,
+                "channels": reference_params.nchannels,
+            },
+            processed_format={
+                "sample_rate": delivered_params.framerate,
+                "channels": delivered_params.nchannels,
+            },
+            reference_samples=reference_mono,
+            processed_samples=delivered_mono,
+            sample_rate=reference_params.framerate,
+            excluded_windows=list(excluded_windows),
+        ),
+    }
+
+
 def _finalize_workflow_file(
     *,
     core_report: dict[str, Any],
@@ -1391,6 +2150,13 @@ def _finalize_workflow_file(
     spectrogram_duration: float,
     run_slug: str,
 ) -> dict[str, Any]:
+    input_file = Path(core_report["input_file"])
+    quality_guard = core_report.get("quality_guard") or {}
+    if quality_guard.get("release_blocked"):
+        failures = ", ".join(quality_guard.get("failures", [])) or "unknown preservation failure"
+        raise RuntimeError(
+            f"audio preservation guard blocked delivery for {input_file.name}: {failures}"
+        )
     if mode.name == "reference-legacy":
         return _finalize_reference_legacy_file(
             core_report=core_report,
@@ -1408,9 +2174,9 @@ def _finalize_workflow_file(
             run_slug=run_slug,
         )
 
-    input_file = Path(core_report["input_file"])
     outputs = core_report["outputs"]
     raw_wav = Path(outputs["raw_wav"])
+    breath_wav = Path(outputs.get("breath_wav") or outputs["raw_wav"])
     denoised_wav = Path(outputs["denoised_wav"])
     clean_wav = Path(outputs["clean_wav"])
     transcript_mp3 = Path(outputs["transcript_mp3"])
@@ -1466,6 +2232,14 @@ def _finalize_workflow_file(
             mute_windows=exact_mute_windows,
             duck_windows=exact_duck_windows,
         )
+    final_delivery_guard = _build_final_delivery_guard(
+        raw_wav,
+        delivered_wav,
+        excluded_windows=_authorized_cleanup_windows(core_report),
+    )
+    if final_delivery_guard["release_blocked"]:
+        failures = ", ".join(final_delivery_guard.get("failures", [])) or "unknown preservation failure"
+        raise RuntimeError(f"final delivery guard blocked {input_file.name}: {failures}")
     shutil.copy2(delivered_wav, final_wav)
     _export_mp3_from_wav(final_wav, final_mp3, ffmpeg_bin=ffmpeg_bin)
     delivered_wav = final_wav
@@ -1477,7 +2251,7 @@ def _finalize_workflow_file(
         focus_dir = workflow_dir / "spectrograms" / "focus"
         step_sources = [
             ("input", input_file),
-            ("respiro_spectra", raw_wav),
+            ("respiro_spectra", breath_wav),
             ("deepfilternet", denoised_wav),
             ("mastered", clean_wav),
             ("delivered", delivered_wav),
@@ -1544,6 +2318,11 @@ def _finalize_workflow_file(
         "core_outputs": outputs,
         "spectrograms": spectrograms,
         "metrics": metrics,
+        "automatic_diagnosis": core_report.get("input_diagnostics"),
+        "quality_guard": {
+            **quality_guard,
+            "final_delivery": final_delivery_guard,
+        },
         "core_report_json": outputs["report_json"],
         "core_report_md": outputs["report_md"],
         "narrow_cleanup": narrow_cleanup_report,
@@ -1658,6 +2437,10 @@ def _finalize_reference_legacy_file(
             duck_windows=exact_duck_windows,
         )
         delivered_wav = exact_output
+    final_delivery_guard = _build_final_delivery_guard(raw_wav, delivered_wav)
+    if final_delivery_guard["release_blocked"]:
+        failures = ", ".join(final_delivery_guard.get("failures", [])) or "unknown preservation failure"
+        raise RuntimeError(f"final delivery guard blocked {input_file.name}: {failures}")
     shutil.copy2(delivered_wav, final_wav)
     _export_mp3_from_wav(final_wav, final_mp3, ffmpeg_bin=ffmpeg_bin)
     delivered_wav = final_wav
@@ -1743,6 +2526,11 @@ def _finalize_reference_legacy_file(
         "core_outputs": outputs,
         "spectrograms": spectrograms,
         "metrics": metrics,
+        "automatic_diagnosis": core_report.get("input_diagnostics"),
+        "quality_guard": {
+            **(core_report.get("quality_guard") or {}),
+            "final_delivery": final_delivery_guard,
+        },
         "core_report_json": outputs["report_json"],
         "core_report_md": outputs["report_md"],
         "narrow_cleanup_a": narrow_cleanup_a_report,
@@ -1777,6 +2565,26 @@ def _render_file_workflow_markdown(report: dict[str, Any]) -> str:
         "",
         "## Metrics",
     ]
+    diagnosis = report.get("automatic_diagnosis") or {}
+    quality_guard = report.get("quality_guard") or {}
+    final_delivery_guard = quality_guard.get("final_delivery") or {}
+    lines.extend(
+        [
+            "",
+            "## Automatic Diagnosis",
+            f"- evidence: `{diagnosis.get('evidence_level', 'UNVERIFIED')}`",
+            f"- estimated_snr_db: `{diagnosis.get('estimated_snr_db', 'n/a')}`",
+            f"- active_dynamic_range_db: `{diagnosis.get('active_dynamic_range_db', 'n/a')}`",
+            f"- stationary_noise: `{diagnosis.get('stationary_noise', 'n/a')}`",
+            "",
+            "## Preservation Guard",
+            f"- status: `{quality_guard.get('status', 'UNVERIFIED')}`",
+            f"- release_blocked: `{quality_guard.get('release_blocked', 'n/a')}`",
+            f"- failures: `{', '.join(quality_guard.get('failures', [])) or 'none'}`",
+            f"- final_delivery_status: `{final_delivery_guard.get('status', 'UNVERIFIED')}`",
+            f"- final_delivery_failures: `{', '.join(final_delivery_guard.get('failures', [])) or 'none'}`",
+        ]
+    )
     for label, metrics in report["metrics"].items():
         lines.extend(
             [
@@ -1870,8 +2678,8 @@ def _render_file_workflow_markdown(report: dict[str, Any]) -> str:
 def _load_wave_samples(audio_path: Path) -> tuple[Any, array]:
     with wave.open(str(audio_path), "rb") as reader:
         params = reader.getparams()
-        if params.sampwidth != 2 or params.nchannels != 1:
-            raise ValueError("Expected mono 16-bit WAV audio")
+        if params.sampwidth != 2 or params.nchannels <= 0:
+            raise ValueError("Expected 16-bit WAV audio with at least one channel")
         raw_frames = reader.readframes(params.nframes)
     samples = array("h")
     samples.frombytes(raw_frames)

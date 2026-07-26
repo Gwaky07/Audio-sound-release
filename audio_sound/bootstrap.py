@@ -10,11 +10,19 @@ from pathlib import Path
 from typing import Any
 
 
+def is_supported_python_version(version: str) -> bool:
+    try:
+        major, minor, *_ = (int(part) for part in str(version).split("."))
+    except (TypeError, ValueError):
+        return False
+    return major == 3 and minor in {10, 11}
+
+
 def build_install_commands(*, repo_root: str | Path, python_executable: str | None = None) -> list[list[str]]:
     python_bin = python_executable or sys.executable
     return [
         [python_bin, "-m", "pip", "install", "pytest>=8.0"],
-        [python_bin, "-m", "pip", "install", "numpy==1.23.0", "librosa==0.10.0", "soundfile", "scipy", "intervaltree==3.1.0"],
+        [python_bin, "-m", "pip", "install", "numpy>=1.24,<2", "librosa==0.10.0", "soundfile", "scipy", "intervaltree==3.1.0"],
         [python_bin, "-m", "pip", "install", "torch==2.2.2"],
         [python_bin, "-m", "pip", "install", "torchaudio==2.2.2"],
         [python_bin, "-m", "pip", "install", "deepfilternet"],
@@ -40,9 +48,10 @@ def build_respiro_setup_commands(*, repo_root: str | Path, tools_dir: str | Path
 def _inspect_python_runtime(python_executable: str) -> dict[str, Any]:
     script = (
         "import importlib.util, json, sys; "
+        "torch_ok = importlib.util.find_spec('torch') is not None; "
         "respiro_ok = importlib.util.find_spec('intervaltree') is not None and importlib.util.find_spec('librosa') is not None; "
         "spec = importlib.util.find_spec('df.enhance') if importlib.util.find_spec('df') else None; "
-        "print(json.dumps({'ok': True, 'path': sys.executable, 'version': sys.version.split()[0], 'deepfilternet_ok': spec is not None, 'respiro_runtime_ok': respiro_ok}))"
+        "print(json.dumps({'ok': True, 'path': sys.executable, 'version': sys.version.split()[0], 'torch_ok': torch_ok, 'deepfilternet_ok': spec is not None, 'respiro_runtime_ok': respiro_ok and torch_ok}))"
     )
     completed = subprocess.run(
         [python_executable, "-c", script],
@@ -57,6 +66,7 @@ def _inspect_python_runtime(python_executable: str) -> dict[str, Any]:
             "version": "",
             "deepfilternet_ok": False,
             "respiro_runtime_ok": False,
+            "torch_ok": False,
             "error": (completed.stderr or completed.stdout or "").strip(),
         }
     try:
@@ -68,19 +78,74 @@ def _inspect_python_runtime(python_executable: str) -> dict[str, Any]:
             "version": "",
             "deepfilternet_ok": False,
             "respiro_runtime_ok": False,
+            "torch_ok": False,
             "error": completed.stdout.strip(),
         }
 
 
-def detect_runtime(*, python_executable: str | None = None, ffmpeg_bin: str = "ffmpeg", ffprobe_bin: str = "ffprobe") -> dict[str, Any]:
+def _inspect_respiro_weights(python_executable: str, weights_path: Path) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            python_executable,
+            "-c",
+            (
+                "import json, sys, torch; "
+                "payload = torch.load(sys.argv[1], map_location='cpu'); "
+                "print(json.dumps({'ok': isinstance(payload, dict) and 'model' in payload}))"
+            ),
+            str(weights_path),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        return {
+            "ok": False,
+            "error": (completed.stderr or completed.stdout or "weight load failed").strip(),
+        }
+    try:
+        return json.loads(completed.stdout.strip())
+    except json.JSONDecodeError:
+        return {"ok": False, "error": completed.stdout.strip()}
+
+
+def detect_runtime(
+    *,
+    repo_root: str | Path | None = None,
+    python_executable: str | None = None,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+) -> dict[str, Any]:
+    from .config import PROJECT_ROOT
+
+    root = Path(repo_root) if repo_root else PROJECT_ROOT
+    python_bin = python_executable or sys.executable
     python_info = _inspect_python_runtime(python_executable or sys.executable)
+    python_supported = is_supported_python_version(str(python_info.get("version") or ""))
     ffmpeg_path = shutil.which(ffmpeg_bin)
     ffprobe_path = shutil.which(ffprobe_bin)
+    respiro_repo = root / "tools" / "Respiro-en"
+    respiro_modules = respiro_repo / "modules.py"
+    respiro_weights = root / "tools" / "respiro-en.pt"
+    assets_ok = respiro_modules.exists() and respiro_weights.exists()
+    runtime_ok = bool(python_info.get("respiro_runtime_ok")) and python_supported
+    weights_check = (
+        _inspect_respiro_weights(python_bin, respiro_weights)
+        if assets_ok and runtime_ok
+        else {"ok": False, "skipped": True}
+    )
+    respiro_ready = assets_ok and runtime_ok and bool(weights_check.get("ok"))
+    deepfilter_runtime_ok = bool(python_info.get("deepfilternet_ok")) and python_supported
     return {
         "python": {
             "ok": bool(python_info.get("ok")),
-            "path": str(python_info.get("path") or (python_executable or sys.executable)),
+            "path": str(python_info.get("path") or python_bin),
             "version": str(python_info.get("version") or ""),
+            "supported": python_supported,
+            "supported_versions": ["3.10", "3.11"],
         },
         "ffmpeg": {
             "ok": bool(ffmpeg_path),
@@ -91,15 +156,34 @@ def detect_runtime(*, python_executable: str | None = None, ffmpeg_bin: str = "f
             "path": ffprobe_path or "",
         },
         "deepfilternet": {
-            "ok": bool(python_info.get("deepfilternet_ok")),
+            "ok": deepfilter_runtime_ok,
+            "ready": deepfilter_runtime_ok,
             "module": "df.enhance",
+            "runtime": {
+                "ok": deepfilter_runtime_ok,
+                "importable": bool(python_info.get("deepfilternet_ok")),
+            },
         },
         "respiro_en": {
-            "ok": bool(python_info.get("respiro_runtime_ok")),
-            "notes": "Requires local Respiro-en repository and respiro-en.pt weights path configuration.",
+            "ok": respiro_ready,
+            "ready": respiro_ready,
+            "assets": {
+                "ok": assets_ok,
+                "repo_path": str(respiro_repo),
+                "modules_path": str(respiro_modules),
+                "weights_path": str(respiro_weights),
+            },
+            "runtime": {
+                "ok": runtime_ok,
+                "torch_importable": bool(python_info.get("torch_ok")),
+                "librosa_intervaltree_importable": bool(
+                    python_info.get("respiro_runtime_ok")
+                ),
+            },
+            "weights": weights_check,
         },
         "spectramini": {
-            "ok": bool(python_info.get("respiro_runtime_ok")),
+            "ok": runtime_ok,
             "notes": "SpectraMini-style breath and mouth-click stages are embedded locally via librosa/scipy helpers.",
         },
     }
@@ -136,7 +220,17 @@ def run_install(*, repo_root: str | Path, python_executable: str | None = None) 
             reason = step["stderr"] or step["stdout"] or "install failed"
             return {"ok": False, "code": "install_failed", "reason": reason, "data": {"steps": steps}}
 
-    return {"ok": True, "code": "ok", "data": {"steps": steps, "runtime": detect_runtime(python_executable=python_executable)}}
+    return {
+        "ok": True,
+        "code": "ok",
+        "data": {
+            "steps": steps,
+            "runtime": detect_runtime(
+                repo_root=root,
+                python_executable=python_executable,
+            ),
+        },
+    }
 
 
 def run_respiro_setup(*, repo_root: str | Path, tools_dir: str | Path) -> dict[str, Any]:
