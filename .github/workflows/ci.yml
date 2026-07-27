@@ -222,7 +222,6 @@ jobs:
         shell: pwsh
         run: |
           $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
-          $python = Join-Path $venv "Scripts\python.exe"
           $verify = Join-Path $venv "Scripts\audio-verify-delivery.exe"
           $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
           $passReport = Join-Path $env:RUNNER_TEMP "ci-verify-report.json"
@@ -246,31 +245,35 @@ jobs:
           foreach ($mutation in $mutations) {
             $broken = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name).json"
             $out = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name)-manifest.json"
-            @'
-            import json, sys
-            from pathlib import Path
-            source_report, target, mutation = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-            payload = json.loads(source_report.read_text(encoding="utf-8"))
-            if mutation == "release_blocked_true":
-                payload["quality_guard"]["release_blocked"] = True
-            elif mutation == "release_blocked_absent":
-                payload["quality_guard"].pop("release_blocked", None)
-            elif mutation == "quality_guard_absent":
-                payload.pop("quality_guard", None)
-            elif mutation == "guard_failures_present":
-                payload["quality_guard"]["failures"] = ["spectral_clarity_lost"]
-            elif mutation == "breath_residual_present":
-                payload["breath_cleanup"]["final_residual_windows"] = [[1.0, 1.2]]
-            elif mutation == "pause_mode_invalid":
-                payload["pause_cleanup"]["mode"] = "legacy_hard_gate"
-            elif mutation == "pause_bridge_enabled":
-                payload["pause_cleanup"]["allow_bridge_windows"] = True
-            else:
-                raise SystemExit(f"unknown mutation {mutation}")
-            target.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            '@ | & $python - $passReport $broken $mutation.name
+            $brokenPayload = Get-Content $passReport -Raw | ConvertFrom-Json
+            switch ($mutation.name) {
+              "release_blocked_true" {
+                $brokenPayload.quality_guard.release_blocked = $true
+              }
+              "release_blocked_absent" {
+                $brokenPayload.quality_guard.PSObject.Properties.Remove("release_blocked")
+              }
+              "quality_guard_absent" {
+                $brokenPayload.PSObject.Properties.Remove("quality_guard")
+              }
+              "guard_failures_present" {
+                $brokenPayload.quality_guard.failures = @("spectral_clarity_lost")
+              }
+              "breath_residual_present" {
+                $brokenPayload.breath_cleanup.final_residual_windows = @(@(1.0, 1.2))
+              }
+              "pause_mode_invalid" {
+                $brokenPayload.pause_cleanup.mode = "legacy_hard_gate"
+              }
+              "pause_bridge_enabled" {
+                $brokenPayload.pause_cleanup.allow_bridge_windows = $true
+              }
+              default {
+                throw "unknown mutation '$($mutation.name)'"
+              }
+            }
+            $brokenPayload | ConvertTo-Json -Depth 100 |
+              Set-Content -LiteralPath $broken -Encoding utf8
 
             & $verify --source $sample --final-wav $wav --final-mp3 $mp3 `
               --report $broken --output $out
