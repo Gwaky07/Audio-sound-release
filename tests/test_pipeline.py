@@ -126,6 +126,36 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(cleaned[:100], samples[:100])
         self.assertEqual(cleaned[200:], samples[200:])
 
+    def test_soft_breath_below_speech_bleed_still_hits_absolute_floor(self) -> None:
+        # Pre-context looks like speech bleed (~-18 dBFS), breath is quieter (~-36)
+        # but still audible. Absolute floor must force ducking.
+        speech = array("h", [4000] * 120)
+        breath = array("h", [520] * 100)
+        tail = array("h", [80] * 100)
+        samples = array("h")
+        samples.extend(speech)
+        samples.extend(breath)
+        samples.extend(tail)
+
+        cleaned, details = apply_adaptive_breath_cleanup(
+            samples,
+            windows=[NoiseWindow(0.12, 0.22)],
+            sample_rate=1000,
+            channels=1,
+            max_attenuation_db=24.0,
+            target_margin_db=-6.0,
+            context_ms=100.0,
+            fade_ms=0.0,
+            absolute_floor_dbfs=-66.0,
+        )
+
+        self.assertEqual(details[0]["absolute_floor_dbfs"], -66.0)
+        self.assertLessEqual(details[0]["target_dbfs"], -66.0)
+        self.assertGreaterEqual(details[0]["requested_attenuation_db"], 18.0)
+        self.assertLess(max(abs(value) for value in cleaned[120:220]), 80)
+        self.assertEqual(cleaned[:120], samples[:120])
+        self.assertEqual(cleaned[220:], samples[220:])
+
     def test_adaptive_cleanup_can_target_measured_global_noise_floor(self) -> None:
         samples = array("h", [2000] * 100)
 

@@ -43,7 +43,7 @@ Preserve the source sample rate, channel count, and stereo layout by default. Mu
 - 不得为了证明仓库“有能力”而无条件串联所有模型。Respiro、DeepFilterNet 和确定性修复阶段按缺陷证据启用；不适用的模型必须说明未触发原因，但用户点名的可安全确定性阶段不能被静默省略。
 - `final` 也必须按输入证据避免已知伤害：当 `stationary_noise=false` 且 `estimated_snr_db>=35` 时，自动关闭整段 `afftdn` secondary denoise，并记录 `input_adaptations=["skip_secondary_denoise_clean_source"]`。这类清洁源仍保留 Respiro 局部呼吸处理、清晰度 EQ、去齿音和稳量，不能用有害整段降噪凑处理阶段。
 - `mouth_declick_sensitivity=0` 必须表示完全关闭全局 mouth-declick，不能仍扫描并插值整段语音。未确认口水音/爆点窗口时，`final` 默认关闭全局 mouth-declick；确认后只允许窄窗口修复。
-- `final` 的呼吸清理必须使用闭环：保留不可变 `raw_wav`，分别记录 Respiro、辅助停顿边缘检测和噪声型频谱证据；只处理位于语音起点之前且呈噪声型的窗口。首轮按相邻停顿底噪自适应衰减，母带后复检并做最多两次窄窗口补处理，最后仍高于局部底噪 3 dB 的确认残留以 `confirmed_breath_residual_after_retry` 阻止交付。
+- `final` 的呼吸清理必须使用闭环：保留不可变 `raw_wav`，分别记录 Respiro、辅助停顿边缘检测和噪声型频谱证据；只处理位于语音起点之前且呈噪声型的窗口。首轮目标为 `min(邻域底噪 + target_margin_db, absolute_floor_dbfs)`（默认 margin `-6`、绝对地板 `-66 dBFS`），避免“邻域被语音拖尾抬高 → 轻吸气已低于邻域 → 0 dB 衰减却仍可听见”。母带后复检并做最多两次窄窗口补处理，最后仍高于该目标超过 `residual_min_excess_db` 的确认残留以 `confirmed_breath_residual_after_retry` 阻止交付。
 - “运行了 Respiro”或“窗口已衰减”不等于呼吸清理完成。报告必须包含 `breath_cleanup.status=PASS`、空的 `final_residual_windows`、实际处理窗口及授权排除窗口；残留检测失败或未验证时不得宣称干净。
 - 呼吸窗口允许从 preservation 频谱/增益比较中排除，但仅限报告中记录且通过语音保护授权的窗口；其他所有语音仍必须通过吞字、相关性、频谱和增益稳定守门。不得用排除窗口掩盖整段伤害。
 - 对比呼吸清理前后频谱时必须使用相同 dB 范围和颜色刻度。紫色/黑色只代表较低能量，不能仅凭自动缩放后的颜色宣称清理完成。
@@ -153,12 +153,12 @@ Do not claim Respiro-en, DeepFilterNet, or SpectraMini were used unless `doctor`
 
 以下能力是本仓库对“修音、处理音频、最终版、Best Repair”请求的固定能力契约，不得仅凭命令成功、模型存在或报告生成就声称已完成：
 
-1. `final` 确定性主链必须能够从原音完成：Respiro/辅助证据驱动的局部呼吸处理、按输入证据决定的保守降噪、清晰度 EQ、轻去齿音、温和压缩/稳量、响度标准化、语音安全停顿清理以及 WAV/MP3 交付。清洁源可以跳过整段降噪，但不得静默省略用户点名且适用的安全阶段。
+1. `final` 确定性主链必须能够从原音完成：立体声左右平衡（保留声道布局）、Respiro/辅助证据驱动的局部呼吸处理、按输入证据决定的保守降噪、清晰度 EQ、轻去齿音、温和压缩/稳量、响度标准化、语音安全停顿清理以及 WAV/MP3 交付。清洁源可以跳过整段降噪，但不得静默省略用户点名且适用的安全阶段。
 2. `auto` 必须至少竞争 `natural_baseline` 与 `final_repair_best`；模型候选只能按固定能力模块和缺陷证据加入。`AUTO_CANDIDATE_RECIPES` 中每个 `preset_name` 必须对应仓库 `presets/*.json` 真实文件；测试与 CI 必须覆盖该契约。`natural_baseline` 不是修音意图的完成结果。
 3. 语音安全 AutoGate 等价能力只能作用于 FFmpeg 静音证据与原音语音保护共同授权的核心窗口。默认目标为 `silence_floor_dbfs=-96`，句间 hold pad 约 45 ms，片头/片尾约 25 ms，使用短 fade；`allow_bridge_windows=false`，禁止无 pad bridge、全局 `agate`、无证据硬静音或以长 crossfade 掩盖残音。残留评估窗被 trim 为空时必须 fail-closed，不得假 PASS。
 4. 源语音保护的敏感度不得低于 preservation hard-mute guard。当前源活跃硬静音阈值为 `-35 dBFS`；低于代表性 speech level 但仍达到该阈值的安静字头、字尾和轻声同样必须保护。清理授权必须双向裁剪首尾活跃语音，并拒绝窗内残留活跃段；不能先处理再用“授权窗口排除”隐藏。
 5. 多声道音频的时间计算必须按 frame 而不是交错 sample 计数：`duration = len(samples) / (sample_rate * channels)`；秒到 sample 索引也必须乘以 `channels`。片头/片尾检测、bridge 测量、局部窗口和淡化均须覆盖单声道与立体声回归测试。
-6. 默认保持原采样率、声道数、声道布局和时长；任何意外变化都是发布阻断问题。最终必须同时生成 WAV 与 MP3，报告处理前后 LUFS、true peak、格式、实际应用阶段和未应用阶段。
+6. 默认保持原采样率、声道数、声道布局和时长；任何意外变化都是发布阻断问题。立体声源必须仍以立体声交付，不得默认下混为单声道。若左右耳活跃音量或音色明显不一致（例如活跃 RMS 差 ≥ 1.5 dB 或相关度过低），`final`/`natural` 必须在提取后执行 `stereo_balance`：选取活跃电平更高的声道复制到左右，生成左右波形与音量完全一致的 dual-mono 立体声布局；不得只抬弱侧而保留异音色，也不得通过改声道数为 mono 来“解决”耳机不平衡。最终必须同时生成 WAV 与 MP3，报告处理前后 LUFS、true peak、格式、实际应用阶段和未应用阶段。
 7. 报告中的授权排除窗口只用于避免把已确认的呼吸/停顿清理误判为伤害，不能替代对完整源音和最终成品的独立 preservation 检查。内部 `quality_guard=PASS` 与独立检查冲突时，结果必须按 FAIL 处理。
 8. 窄窗 onset / 参考风格清理逻辑住在 `audio_sound/narrow_onset_cleanup.py`；`scripts/narrow_onset_cleanup.py` 只是 CLI 薄包装。业务代码必须 `from audio_sound.narrow_onset_cleanup import ...` 或相对导入 `.narrow_onset_cleanup`，不得再把核心算法绑在 `scripts.*` 上。
 9. `detect_runtime()` 未传 `repo_root` 时必须默认仓库 `PROJECT_ROOT`，不得依赖当前工作目录去找 `tools/`。
@@ -172,7 +172,7 @@ Do not claim Respiro-en, DeepFilterNet, or SpectraMini were used unless `doctor`
 
 1. **可安装包**：`pyproject.toml` 只打包 `audio_sound`，提供 `audio-cleanup`、`audio-skill-workflow`、`audio-remove-segments`、`audio-audit-release`、`audio-verify-delivery`。`setup.cmd` 必须 `pip install --editable .` 到仓库 `.venv`。wheel 必须内置 `audio_sound/presets/*.json`；仓库根 `presets/*.json` 是可编辑源，两份内容必须由测试逐字节校验，禁止漂移。仓库 `scripts/` 只是本地 CLI 薄入口，**禁止**再注册为顶层 setuptools 包名 `scripts`。
 2. **Python**：仅 3.10 / 3.11；处理与模型必须用 `.venv\Scripts\python.exe`。
-3. **源码安装冒烟**：CI 必须 `git archive` 后构建 wheel，在检出目录外新建 venv 安装，并至少导入 `audio_sound.auto_workflow`、`audio_sound.agent_judgment`、`audio_sound.skill_workflow`、`audio_sound.narrow_onset_cleanup`、`audio_sound.exact_window_cleanup`、`audio_sound.pair_evaluation`、`audio_sound.media_utils`、`audio_sound.delivery_verifier`，确认顶层 `scripts` 包不存在，验证 packaged presets，再跑 `audio-skill-workflow ... --dry-run` 与 `audio-verify-delivery --help`。所有含真实逻辑的模块都必须住在 `audio_sound/`；`scripts/*.py` 只能是薄 shim。
+3. **源码安装冒烟**：CI 必须 `git archive` 后构建 wheel，在检出目录外新建 venv 安装，并至少导入 `audio_sound.auto_workflow`、`audio_sound.agent_judgment`、`audio_sound.skill_workflow`、`audio_sound.narrow_onset_cleanup`、`audio_sound.exact_window_cleanup`、`audio_sound.stereo_balance`、`audio_sound.pair_evaluation`、`audio_sound.media_utils`、`audio_sound.delivery_verifier`，确认顶层 `scripts` 包不存在，验证 packaged presets，再跑 `audio-skill-workflow ... --dry-run` 与 `audio-verify-delivery --help`。所有含真实逻辑的模块都必须住在 `audio_sound/`；`scripts/*.py` 只能是薄 shim。
 4. **测试门禁**：`.github/workflows/ci.yml` 必须在 Python 3.10 / 3.11 跑全量 `pytest`，并在隔离 wheel 环境用合成口播样本真实执行一次无模型 `final` 确定性链，生成 WAV/MP3、确认格式保持，再做独立 pair guard PASS 与 `audio-verify-delivery` 冒烟。不得把完整 `setup.cmd`（含 torch / Respiro 资产）当作 CI 阻断步骤。
 5. **运行时诊断门禁**：CI 必须解析 `doctor`，确认 Python 受支持且 Respiro / DeepFilterNet capability state 字段存在。缺少 bundled `tools/`、仓库内 `ffmpeg/`、模型权重时，模型 `ready=false` 是可接受事实，但不得伪造 ready，也不得让无模型单元测试失败。
 6. **对比与验证模块**：`scripts/evaluate_audio_pair.py` 是薄入口，核心在 `audio_sound/pair_evaluation.py`；独立无排除对比与 `verify_delivery` 不得传授权排除窗口来“洗绿”报告。`quality_guard.release_blocked` 缺失时必须 fail-closed 视为 `True`；测试与 CI 必须锁住该默认。

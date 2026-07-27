@@ -37,6 +37,16 @@
   "filters": {
     "highpass_hz": 55,
     "lowpass_hz": null,
+    "stereo_balance": {
+      "enabled": true,
+      "min_imbalance_db": 1.5,
+      "max_channel_gain_db": 12.0,
+      "target": "louder",
+      "correlation_trigger": 0.85,
+      "mismatch_mode": "dual_mono_louder",
+      "decorrelated_mode": "dual_mono_louder",
+      "mid_blend_when_decorrelated": 0.0
+    },
     "secondary_denoise": {
       "enabled": false,
       "nr": 6,

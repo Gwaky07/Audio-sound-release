@@ -105,6 +105,8 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(policy["enabled"])
         self.assertEqual(policy["first_pass_max_attenuation_db"], 24.0)
         self.assertEqual(policy["second_pass_max_attenuation_db"], 12.0)
+        self.assertEqual(policy["target_margin_db"], -6.0)
+        self.assertEqual(policy["absolute_floor_dbfs"], -66.0)
         self.assertEqual(policy["max_retries"], 2)
         self.assertTrue(policy["final_residual_check"])
         pause_policy = preset["filters"]["pause_residual_cleanup"]

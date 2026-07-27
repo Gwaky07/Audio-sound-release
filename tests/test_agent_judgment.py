@@ -29,6 +29,8 @@ class AgentJudgmentTests(unittest.TestCase):
         self.assertEqual(plan["primary_candidate"], "final_repair_best")
         self.assertTrue(capabilities["breath_cleanup"]["needed"])
         self.assertTrue(capabilities["pause_cleanup"]["needed"])
+        self.assertTrue(capabilities["stereo_balance"]["needed"])
+        self.assertTrue(capabilities["stereo_balance"]["preserve_channels"])
         self.assertFalse(capabilities["denoise"]["needed"])
         self.assertEqual(
             capabilities["denoise"]["skipped_reason"],

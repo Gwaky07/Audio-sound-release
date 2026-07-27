@@ -21,6 +21,7 @@ from .media_utils import (
     build_mp3_export_command,
     load_pcm16_wave as _load_wave_samples,
 )
+from .stereo_balance import run_stereo_balance, write_pcm16_wave
 
 SUPPORTED_MEDIA_EXTENSIONS = {
     ".wav",
@@ -555,6 +556,7 @@ def apply_adaptive_breath_cleanup(
     context_ms: float,
     fade_ms: float,
     target_dbfs_override: float | None = None,
+    absolute_floor_dbfs: float | None = None,
 ) -> tuple[array, list[dict[str, Any]]]:
     cleaned = array("h", samples)
     details: list[dict[str, Any]] = []
@@ -566,30 +568,40 @@ def apply_adaptive_breath_cleanup(
             sample_rate=sample_rate,
             channels=channels,
         )
-        context_window = NoiseWindow(
-            max(0.0, window.start_seconds - context_seconds),
-            window.start_seconds,
-        )
-        context_samples = _window_samples(
+        pre_context = _window_samples(
             samples,
-            context_window,
+            NoiseWindow(
+                max(0.0, window.start_seconds - context_seconds),
+                window.start_seconds,
+            ),
             sample_rate=sample_rate,
             channels=channels,
         )
-        if not context_samples:
-            context_samples = _window_samples(
-                samples,
-                NoiseWindow(window.end_seconds, window.end_seconds + context_seconds),
-                sample_rate=sample_rate,
-                channels=channels,
-            )
-        window_dbfs = _amplitude_to_dbfs(_compute_rms(window_samples))
-        context_dbfs = _amplitude_to_dbfs(_compute_rms(context_samples))
-        target_dbfs = (
-            float(target_dbfs_override)
-            if target_dbfs_override is not None
-            else context_dbfs + float(target_margin_db)
+        post_context = _window_samples(
+            samples,
+            NoiseWindow(
+                window.end_seconds,
+                window.end_seconds + context_seconds,
+            ),
+            sample_rate=sample_rate,
+            channels=channels,
         )
+        context_levels: list[float] = []
+        if pre_context:
+            context_levels.append(_amplitude_to_dbfs(_compute_rms(pre_context)))
+        if post_context:
+            context_levels.append(_amplitude_to_dbfs(_compute_rms(post_context)))
+        # Prefer the quieter side so speech bleed immediately before an inhale
+        # does not raise the adaptive target and skip soft but audible breaths.
+        context_dbfs = min(context_levels) if context_levels else -120.0
+        window_dbfs = _amplitude_to_dbfs(_compute_rms(window_samples))
+        relative_target = context_dbfs + float(target_margin_db)
+        if target_dbfs_override is not None:
+            target_dbfs = float(target_dbfs_override)
+        elif absolute_floor_dbfs is not None:
+            target_dbfs = min(relative_target, float(absolute_floor_dbfs))
+        else:
+            target_dbfs = relative_target
         requested_db = max(
             0.0,
             min(float(max_attenuation_db), window_dbfs - target_dbfs),
@@ -610,6 +622,12 @@ def apply_adaptive_breath_cleanup(
                 "window_dbfs": round(window_dbfs, 3),
                 "context_dbfs": round(context_dbfs, 3),
                 "target_dbfs": round(target_dbfs, 3),
+                "relative_target_dbfs": round(relative_target, 3),
+                "absolute_floor_dbfs": (
+                    None
+                    if absolute_floor_dbfs is None
+                    else round(float(absolute_floor_dbfs), 3)
+                ),
                 "requested_attenuation_db": round(requested_db, 3),
             }
         )
@@ -2470,6 +2488,32 @@ def _find_single_wav(directory: Path) -> Path:
     return candidates[0]
 
 
+def _run_stereo_balance_stage(
+    *,
+    raw_wav: Path,
+    samples: array,
+    sample_rate: int,
+    channels: int,
+    policy: dict[str, Any] | None,
+) -> tuple[array, dict[str, Any]]:
+    """Balance stereo ear mismatch without changing channel count."""
+    balanced, report = run_stereo_balance(
+        samples,
+        sample_rate=sample_rate,
+        channels=channels,
+        policy=policy,
+    )
+    if report.get("status") == "PASS" and report.get("plan", {}).get("applied"):
+        write_pcm16_wave(
+            raw_wav,
+            balanced,
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+        return balanced, report
+    return samples, report
+
+
 def _processing_steps(
     preset: dict[str, Any],
     *,
@@ -2477,6 +2521,9 @@ def _processing_steps(
     skip_deepfilternet: bool = False,
 ) -> list[str]:
     steps = ["Extract source audio to WAV"]
+    filters = preset["filters"]
+    if filters.get("stereo_balance", {}).get("enabled"):
+        steps.append("Stereo channel balance while preserving channel layout")
     stage_types = [stage.get("type") for stage in preset.get("pipeline", {}).get("stages", []) if stage.get("enabled", True)]
     if "respiro" in stage_types:
         steps.append("Breath detection via Respiro-en")
@@ -2487,7 +2534,6 @@ def _processing_steps(
             steps.append("SpectraMini-style mouth de-click")
     if "deepfilternet" in stage_types and not skip_deepfilternet:
         steps.append("Primary denoise via DeepFilterNet")
-    filters = preset["filters"]
     if filters.get("equalizer", {}).get("enabled"):
         steps.append("Clarity shaping via parametric equalizer")
     if filters.get("declick", {}).get("enabled"):
@@ -2525,6 +2571,9 @@ def _noise_print_processing_steps(
     skip_deepfilternet: bool = False,
 ) -> list[str]:
     steps = ["Extract source audio to WAV"]
+    filters = preset["filters"]
+    if filters.get("stereo_balance", {}).get("enabled"):
+        steps.append("Stereo channel balance while preserving channel layout")
     stage_types = [stage.get("type") for stage in preset.get("pipeline", {}).get("stages", []) if stage.get("enabled", True)]
     if "respiro" in stage_types:
         steps.append("Breath detection via Respiro-en")
@@ -2539,7 +2588,6 @@ def _noise_print_processing_steps(
             "Noise-print denoise via afftdn sample capture",
         ]
     )
-    filters = preset["filters"]
     if filters.get("equalizer", {}).get("enabled"):
         steps.append("Clarity shaping via parametric equalizer")
     if filters.get("declick", {}).get("enabled"):
@@ -3128,6 +3176,11 @@ def _run_breath_residual_cleanup(
                 target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
                 context_ms=float(breath_cleanup_policy["context_ms"]),
                 fade_ms=float(breath_cleanup_policy["fade_ms"]),
+                absolute_floor_dbfs=(
+                    None
+                    if breath_cleanup_policy.get("absolute_floor_dbfs") is None
+                    else float(breath_cleanup_policy["absolute_floor_dbfs"])
+                ),
             )
             report["breath_cleanup"]["second_pass"] = second_pass_details
             if second_cleaned != clean_samples:
@@ -3166,6 +3219,11 @@ def _run_breath_residual_cleanup(
             target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
             context_ms=float(breath_cleanup_policy["context_ms"]),
             fade_ms=0.0,
+            absolute_floor_dbfs=(
+                None
+                if breath_cleanup_policy.get("absolute_floor_dbfs") is None
+                else float(breath_cleanup_policy["absolute_floor_dbfs"])
+            ),
         )
         minimum_excess_db = float(
             breath_cleanup_policy.get("residual_min_excess_db", 3.0)
@@ -3193,6 +3251,11 @@ def _run_breath_residual_cleanup(
                 target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
                 context_ms=float(breath_cleanup_policy["context_ms"]),
                 fade_ms=float(breath_cleanup_policy["fade_ms"]),
+                absolute_floor_dbfs=(
+                    None
+                    if breath_cleanup_policy.get("absolute_floor_dbfs") is None
+                    else float(breath_cleanup_policy["absolute_floor_dbfs"])
+                ),
             )
             report["breath_cleanup"]["final_repair_pass"] = final_repair_details
             if final_repaired != final_samples:
@@ -3230,6 +3293,11 @@ def _run_breath_residual_cleanup(
                 target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
                 context_ms=float(breath_cleanup_policy["context_ms"]),
                 fade_ms=0.0,
+                absolute_floor_dbfs=(
+                    None
+                    if breath_cleanup_policy.get("absolute_floor_dbfs") is None
+                    else float(breath_cleanup_policy["absolute_floor_dbfs"])
+                ),
             )
             confirmed_final_residuals = [
                 window
@@ -3435,6 +3503,13 @@ def process_media_file(
             "attenuation_stats": {},
             "failures": [],
         },
+        "stereo_balance": {
+            "status": "NOT_APPLICABLE",
+            "before": None,
+            "plan": None,
+            "after": None,
+            "preserve_channels": True,
+        },
         "input_diagnostics": None,
         "output_diagnostics": None,
         "quality_guard": None,
@@ -3450,6 +3525,19 @@ def process_media_file(
     _run_recorded_command(extract_command, executed)
 
     raw_params, raw_samples = _load_wave_samples(layout.raw_wav)
+    stereo_policy = (
+        preset.get("filters", {}).get("stereo_balance")
+        if isinstance(preset.get("filters"), dict)
+        else None
+    )
+    raw_samples, stereo_balance_report = _run_stereo_balance_stage(
+        raw_wav=layout.raw_wav,
+        samples=raw_samples,
+        sample_rate=raw_params.framerate,
+        channels=raw_params.nchannels,
+        policy=stereo_policy if isinstance(stereo_policy, dict) else None,
+    )
+    report["stereo_balance"] = stereo_balance_report
     input_mono = _analysis_samples(raw_params, raw_samples)
     input_analysis = analyze_pcm16_samples(
         input_mono,
@@ -3610,6 +3698,11 @@ def process_media_file(
                 target_margin_db=float(breath_cleanup_policy["target_margin_db"]),
                 context_ms=float(breath_cleanup_policy["context_ms"]),
                 fade_ms=float(breath_cleanup_policy["fade_ms"]),
+                absolute_floor_dbfs=(
+                    None
+                    if breath_cleanup_policy.get("absolute_floor_dbfs") is None
+                    else float(breath_cleanup_policy["absolute_floor_dbfs"])
+                ),
             )
             report["breath_cleanup"]["first_pass"] = first_pass_details
         else:

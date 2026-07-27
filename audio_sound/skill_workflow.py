@@ -1419,22 +1419,28 @@ def _run_single_mode_skill_workflow(
     for report_item in batch_summary["reports"]:
         core_report_path = Path(report_item["report_json"])
         core_report = json.loads(core_report_path.read_text(encoding="utf-8"))
+        finalized = _finalize_workflow_file(
+            core_report=core_report,
+            mode=mode,
+            ffmpeg_bin=ffmpeg_bin,
+            reference_target_lufs=resolved_target_lufs if resolved_target_lufs is not None else -24.7,
+            focus_windows=focus_windows,
+            exact_mute_windows=exact_mute_windows,
+            exact_duck_windows=exact_duck_windows,
+            skip_spectrograms=skip_spectrograms,
+            skip_bridge_cleanup=skip_bridge_cleanup or not mode.apply_bridge_cleanup,
+            delivery_dir=resolved_delivery_dir,
+            delivery_prefix=delivery_prefix,
+            spectrogram_start=spectrogram_start,
+            spectrogram_duration=spectrogram_duration,
+            run_slug=run_slug,
+        )
         files.append(
-            _finalize_workflow_file(
+            _attach_direct_mode_repair_judgment(
                 core_report=core_report,
-                mode=mode,
-                ffmpeg_bin=ffmpeg_bin,
-                reference_target_lufs=resolved_target_lufs if resolved_target_lufs is not None else -24.7,
-                focus_windows=focus_windows,
-                exact_mute_windows=exact_mute_windows,
-                exact_duck_windows=exact_duck_windows,
-                skip_spectrograms=skip_spectrograms,
-                skip_bridge_cleanup=skip_bridge_cleanup or not mode.apply_bridge_cleanup,
-                delivery_dir=resolved_delivery_dir,
-                delivery_prefix=delivery_prefix,
-                spectrogram_start=spectrogram_start,
-                spectrogram_duration=spectrogram_duration,
-                run_slug=run_slug,
+                core_report_path=core_report_path,
+                mode_name=mode.name,
+                finalized=finalized,
             )
         )
 
@@ -2107,6 +2113,80 @@ def _build_final_delivery_guard(
             excluded_windows=list(excluded_windows),
         ),
     }
+
+
+def _attach_direct_mode_repair_judgment(
+    *,
+    core_report: dict[str, Any],
+    core_report_path: Path,
+    mode_name: str,
+    finalized: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach capability_plan/repair_scorecard for direct final deliveries.
+
+    Auto mode already embeds these via candidate selection. Direct `--mode final`
+    must still satisfy repair-intent delivery verification.
+    """
+    preset_name = str(core_report.get("preset_name") or "")
+    if mode_name != "final" and preset_name != "final":
+        return finalized
+
+    from .agent_judgment import (
+        build_capability_plan,
+        build_repair_scorecard,
+        delivery_completeness,
+    )
+
+    capability_plan = build_capability_plan(core_report.get("input_diagnostics") or {})
+    repair_scorecard = build_repair_scorecard(
+        core_report=core_report,
+        quality_guard=core_report.get("quality_guard") or {},
+        capability_plan=capability_plan,
+        candidate_id="final_repair_best",
+    )
+    completeness = delivery_completeness(
+        candidate_id="final_repair_best",
+        repair_intent=True,
+    )
+    judgment = {
+        "capability_plan": capability_plan,
+        "repair_scorecard": repair_scorecard,
+        **completeness,
+    }
+    core_report.update(judgment)
+    core_report_path.write_text(
+        json.dumps(core_report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    finalized.update(judgment)
+    workflow_report_json = finalized.get("workflow_report_json")
+    if workflow_report_json:
+        report_path = Path(str(workflow_report_json))
+        if report_path.is_file():
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            payload.update(judgment)
+            payload["core_report"] = {
+                key: core_report.get(key)
+                for key in (
+                    "stereo_balance",
+                    "breath_cleanup",
+                    "pause_cleanup",
+                    "quality_guard",
+                    "capability_plan",
+                    "repair_scorecard",
+                    "delivery_incomplete_for_repair_intent",
+                    "preset_name",
+                    "input_adaptations",
+                    "stage_status",
+                    "processing_steps",
+                )
+                if key in core_report
+            }
+            report_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+    return finalized
 
 
 def _finalize_workflow_file(

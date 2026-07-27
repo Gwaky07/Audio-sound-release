@@ -237,6 +237,7 @@ class PackagingContractTests(unittest.TestCase):
         for module_name in (
             "audio_sound.narrow_onset_cleanup",
             "audio_sound.exact_window_cleanup",
+            "audio_sound.stereo_balance",
             "audio_sound.delivery_verifier",
             "audio_sound.pair_evaluation",
             "audio_sound.media_utils",

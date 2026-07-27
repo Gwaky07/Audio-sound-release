@@ -32,6 +32,12 @@ def build_capability_plan(
         denoise_needed = False
 
     capabilities = {
+        "stereo_balance": {
+            "needed": True,
+            "skipped_reason": None,
+            "execution": "final.stereo_balance",
+            "preserve_channels": True,
+        },
         "breath_cleanup": {
             "needed": breath_needed,
             "skipped_reason": None
@@ -177,6 +183,10 @@ def build_repair_scorecard(
     leveling_applied = any("compress" in step for step in processing_steps)
     loudness_applied = any("loudnorm" in step or "loudness" in step for step in processing_steps)
 
+    stereo_balance = core_report.get("stereo_balance") or {}
+    stereo_status = str(stereo_balance.get("status", "")).upper()
+    stereo_failed = stereo_status == "FAIL"
+
     no_swallow = not any(
         code in failures
         for code in (
@@ -189,6 +199,20 @@ def build_repair_scorecard(
     no_harshness = "spectral_harshness_increased" not in failures
 
     scorecard = {
+        "stereo_balance": {
+            "status": "FAIL" if stereo_failed else "PASS",
+            "detail": {
+                "status": stereo_balance.get("status"),
+                "imbalance_before_db": (stereo_balance.get("before") or {}).get(
+                    "imbalance_db"
+                ),
+                "imbalance_after_db": (stereo_balance.get("after") or {}).get(
+                    "imbalance_db"
+                ),
+                "preserve_channels": stereo_balance.get("preserve_channels", True),
+                "plan": stereo_balance.get("plan"),
+            },
+        },
         "breath_cleanup": {
             "status": _capability_status(
                 needed=bool((capabilities.get("breath_cleanup") or {}).get("needed")),
@@ -289,6 +313,7 @@ def build_repair_scorecard(
         "no_harshness",
         "breath_cleanup",
         "pause_cleanup",
+        "stereo_balance",
     )
     failed_items = [
         key for key in hard_fail_keys if scorecard[key]["status"] == "FAIL"

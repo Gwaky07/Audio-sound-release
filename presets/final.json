@@ -37,6 +37,16 @@
   "filters": {
     "highpass_hz": 65,
     "lowpass_hz": null,
+    "stereo_balance": {
+      "enabled": true,
+      "min_imbalance_db": 1.5,
+      "max_channel_gain_db": 12.0,
+      "target": "louder",
+      "correlation_trigger": 0.85,
+      "mismatch_mode": "dual_mono_louder",
+      "decorrelated_mode": "dual_mono_louder",
+      "mid_blend_when_decorrelated": 0.0
+    },
     "equalizer": {
       "enabled": true,
       "bands": [
@@ -133,7 +143,8 @@
       "merge_auxiliary_detection": true,
       "first_pass_max_attenuation_db": 24.0,
       "second_pass_max_attenuation_db": 12.0,
-      "target_margin_db": 3.0,
+      "target_margin_db": -6.0,
+      "absolute_floor_dbfs": -66.0,
       "context_ms": 120.0,
       "fade_ms": 18.0,
       "max_retries": 2,
