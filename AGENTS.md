@@ -44,7 +44,7 @@ Preserve the source sample rate, channel count, and stereo layout by default. Mu
 - `final` 也必须按输入证据避免已知伤害：当 `stationary_noise=false` 且 `estimated_snr_db>=35` 时，自动关闭整段 `afftdn` secondary denoise，并记录 `input_adaptations=["skip_secondary_denoise_clean_source"]`。这类清洁源仍保留 Respiro 局部呼吸处理、清晰度 EQ、去齿音和稳量，不能用有害整段降噪凑处理阶段。
 - `mouth_declick_sensitivity=0` 必须表示完全关闭全局 mouth-declick，不能仍扫描并插值整段语音。未确认口水音/爆点窗口时，`final` 默认关闭全局 mouth-declick；确认后只允许窄窗口修复。
 - `final` 的呼吸清理必须使用闭环：保留不可变 `raw_wav`，分别记录 Respiro、辅助停顿边缘检测和噪声型频谱证据；只处理位于语音起点之前且呈噪声型的窗口。首轮目标为 `min(邻域底噪 + target_margin_db, absolute_floor_dbfs)`（默认 margin `-6`、绝对地板 `-66 dBFS`），避免“邻域被语音拖尾抬高 → 轻吸气已低于邻域 → 0 dB 衰减却仍可听见”。母带后复检并做最多两次窄窗口补处理，最后仍高于该目标超过 `residual_min_excess_db` 的确认残留以 `confirmed_breath_residual_after_retry` 阻止交付。
-- 句首到第一处活跃语音起点之前的轻噪声/气口，必须在母带/`loudnorm` 前封到静音地板，并在母带后再做一次安全封印；禁止把原片不可闻的轻噪声动态抬成可听轰鸣。质量守门必须能以 `pre_speech_soft_noise_boosted` 拦截“源轻噪声被放大成可听能量”的交付。
+- 句首到第一处活跃语音起点之前的轻噪声/气口，必须以源音活跃语音起点（与 hard-mute 同阈）为证据，在母带/`loudnorm` 前封到静音地板，并在母带后再做一次安全封印；hold pad 约 45 ms，不得无证据整段硬静音或吞掉保留字头。禁止把原片不可闻的轻噪声动态抬成可听轰鸣。质量守门必须能以 `pre_speech_soft_noise_boosted` 拦截“源轻噪声被放大成可听能量”的交付，且不得用授权排除窗口洗绿该检查。
 - “运行了 Respiro”或“窗口已衰减”不等于呼吸清理完成。报告必须包含 `breath_cleanup.status=PASS`、空的 `final_residual_windows`、实际处理窗口及授权排除窗口；残留检测失败或未验证时不得宣称干净。
 - 呼吸窗口允许从 preservation 频谱/增益比较中排除，但仅限报告中记录且通过语音保护授权的窗口；其他所有语音仍必须通过吞字、相关性、频谱和增益稳定守门。不得用排除窗口掩盖整段伤害。
 - 对比呼吸清理前后频谱时必须使用相同 dB 范围和颜色刻度。紫色/黑色只代表较低能量，不能仅凭自动缩放后的颜色宣称清理完成。
