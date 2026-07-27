@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PRESETS_DIR = PROJECT_ROOT / "presets"
+REPOSITORY_PRESETS_DIR = PROJECT_ROOT / "presets"
+PACKAGE_PRESETS_DIR = Path(__file__).resolve().parent / "presets"
+PRESETS_DIR = (
+    REPOSITORY_PRESETS_DIR
+    if REPOSITORY_PRESETS_DIR.is_dir()
+    else PACKAGE_PRESETS_DIR
+)
 
 
 def list_presets() -> list[str]:
@@ -98,9 +104,13 @@ def resolve_binary(name: str, default: str, env_values: dict[str, str] | None = 
     return os.environ.get(name) or values.get(name) or default
 
 
-def resolve_repo_python(repo_root: str | Path | None = None) -> str:
+def resolve_repo_python(
+    repo_root: str | Path | None = None,
+    *,
+    require_venv: bool = False,
+) -> str:
     root = Path(repo_root) if repo_root else PROJECT_ROOT
     candidate = root / ".venv" / "Scripts" / "python.exe"
-    if candidate.exists():
+    if candidate.exists() or require_venv:
         return str(candidate)
     return sys.executable

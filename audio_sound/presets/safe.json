@@ -1,0 +1,88 @@
+{
+  "name": "safe",
+  "description": "Best default for spoken-word cleanup when natural delivery matters and over-processing should be controlled.",
+  "notes": [
+    "This is the default preset for natural-language calls.",
+    "It balances DeepFilterNet cleanup with conservative gating and loudness control."
+  ],
+  "pipeline": {
+    "stages": [
+      {
+        "type": "respiro",
+        "enabled": true,
+        "threshold": 0.064,
+        "min_length_ms": 20
+      },
+      {
+        "type": "spectramini",
+        "enabled": true,
+        "breath_control_reduction": 0.55,
+        "breath_control_sensitivity": 0.55,
+        "mouth_declick_sensitivity": 0.55
+      },
+      {
+        "type": "deepfilternet",
+        "enabled": true,
+        "module": "df.enhance",
+        "post_filter": true
+      }
+    ]
+  },
+  "extract": {
+    "sample_rate": 48000,
+    "channels": 1,
+    "pcm_codec": "pcm_s16le"
+  },
+  "filters": {
+    "highpass_hz": 70,
+    "lowpass_hz": 12000,
+    "secondary_denoise": {
+      "enabled": true,
+      "nr": 10,
+      "nf": -26,
+      "tracking": true
+    },
+    "gate": {
+      "enabled": true,
+      "threshold": 0.018,
+      "ratio": 2.5,
+      "attack_ms": 15,
+      "release_ms": 220,
+      "makeup_db": 0
+    },
+    "compressor": {
+      "enabled": true,
+      "threshold_db": -18,
+      "ratio": 2.0,
+      "attack_ms": 12,
+      "release_ms": 140,
+      "makeup_db": 0
+    },
+    "pause_residual_cleanup": {
+      "enabled": true,
+      "silence_threshold_db": -42,
+      "silence_min_duration": 0.18,
+      "min_neighbor_silence_duration": 0.6,
+      "bridge_max_duration": 0.32,
+      "bridge_peak_db": -34,
+      "bridge_rms_db": -42,
+      "core_pad_ms": 60,
+      "fade_ms": 18,
+      "floor_gain": 0.0
+    },
+    "loudnorm": {
+      "target_i": -20.0,
+      "target_lra": 5.0,
+      "target_tp": -9.0
+    }
+  },
+  "analysis": {
+    "silence_candidates": false,
+    "silence_threshold_db": -38,
+    "silence_min_duration": 0.12
+  },
+  "transcript_export": {
+    "codec": "libmp3lame",
+    "bitrate": "192k"
+  }
+}

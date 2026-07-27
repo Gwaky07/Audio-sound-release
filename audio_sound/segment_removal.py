@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .config import PROJECT_ROOT, load_env_file, resolve_binary
+from .media_utils import export_mp3, format_seconds as _format_seconds
 from .skill_workflow import _safe_windows_stem
 
 
@@ -578,28 +579,6 @@ def measure_wav_duration_seconds(path: Path) -> float:
         return wav_file.getnframes() / float(wav_file.getframerate())
 
 
-def export_mp3(source_wav: Path, output_mp3: Path, *, ffmpeg_bin: str) -> None:
-    _run_command(
-        [
-            ffmpeg_bin,
-            "-y",
-            "-hide_banner",
-            "-nostdin",
-            "-i",
-            str(source_wav),
-            "-codec:a",
-            "libmp3lame",
-            "-q:a",
-            "2",
-            str(output_mp3),
-        ]
-    )
-
-
-def _format_seconds(value: float) -> str:
-    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
-
-
 def build_video_trim_filter(
     keep_intervals: Sequence[KeepInterval],
     *,
@@ -620,20 +599,23 @@ def build_video_trim_filter(
     if len(adjusted_intervals) == 1:
         interval = adjusted_intervals[0]
         return (
-            f"[0:v]trim=start={_format_seconds(interval.start_seconds)}:"
-            f"end={_format_seconds(interval.end_seconds)},setpts=PTS-STARTPTS[vout]"
+            f"[0:v]trim=start={_format_seconds(interval.start_seconds, precision=6)}:"
+            f"end={_format_seconds(interval.end_seconds, precision=6)},setpts=PTS-STARTPTS[vout]"
         )
     parts: list[str] = []
     concat_inputs: list[str] = []
     for index, interval in enumerate(adjusted_intervals):
         label = f"v{index}"
         filter_chain = (
-            f"[0:v]trim=start={_format_seconds(interval.start_seconds)}:"
-            f"end={_format_seconds(interval.end_seconds)},setpts=PTS-STARTPTS"
+            f"[0:v]trim=start={_format_seconds(interval.start_seconds, precision=6)}:"
+            f"end={_format_seconds(interval.end_seconds, precision=6)},setpts=PTS-STARTPTS"
         )
         if index < len(seam_pause_frames) and seam_pause_frames[index] > 0:
             pause_seconds = seam_pause_frames[index] / sample_rate
-            filter_chain += f",tpad=stop_mode=clone:stop_duration={_format_seconds(pause_seconds)}"
+            filter_chain += (
+                ",tpad=stop_mode=clone:stop_duration="
+                f"{_format_seconds(pause_seconds, precision=6)}"
+            )
         parts.append(f"{filter_chain}[{label}]")
         concat_inputs.append(f"[{label}]")
     parts.append(f"{''.join(concat_inputs)}concat=n={len(adjusted_intervals)}:v=1:a=0[vout]")
@@ -776,7 +758,12 @@ def process_segment_removal_job(
             seam_pause_ms=seam_pause_ms,
             seam_pause_ms_by_join=seam_pause_ms_by_join,
         )
-        export_mp3(delivery_paths.wav, delivery_paths.mp3, ffmpeg_bin=ffmpeg_bin)
+        export_mp3(
+            delivery_paths.wav,
+            delivery_paths.mp3,
+            ffmpeg_bin=ffmpeg_bin,
+            quality=2,
+        )
         mp4_path: Path | None = None
         if probe.has_video:
             export_synced_mp4(

@@ -3,16 +3,78 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from audio_sound.bootstrap import (
     build_install_commands,
     build_respiro_setup_commands,
+    detect_runtime,
     format_runtime_report,
+    is_supported_python_version,
     prune_workspace,
 )
+from audio_sound.config import PROJECT_ROOT
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_supported_python_version_rejects_unsupported_runtime(self) -> None:
+        self.assertTrue(is_supported_python_version("3.10.14"))
+        self.assertTrue(is_supported_python_version("3.11.9"))
+        self.assertFalse(is_supported_python_version("3.12.0"))
+        self.assertFalse(is_supported_python_version("3.14.3"))
+
+    def test_detect_runtime_defaults_to_project_root(self) -> None:
+        with (
+            mock.patch(
+                "audio_sound.bootstrap._inspect_python_runtime",
+                return_value={
+                    "ok": True,
+                    "path": "python",
+                    "version": "3.11.9",
+                    "deepfilternet_ok": False,
+                    "respiro_runtime_ok": False,
+                    "torch_ok": False,
+                },
+            ),
+            mock.patch("audio_sound.bootstrap.shutil.which", return_value="tool.exe"),
+            mock.patch("audio_sound.bootstrap.Path.cwd", return_value=Path("S:/not-the-repo")),
+        ):
+            payload = detect_runtime(python_executable="python")
+
+        expected_weights = (PROJECT_ROOT / "tools" / "respiro-en.pt").resolve()
+        self.assertEqual(
+            Path(payload["respiro_en"]["assets"]["weights_path"]).resolve(),
+            expected_weights,
+        )
+
+    def test_detect_runtime_reports_assets_separately_from_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "tools" / "Respiro-en").mkdir(parents=True)
+            (root / "tools" / "Respiro-en" / "modules.py").write_text("", encoding="utf-8")
+            (root / "tools" / "respiro-en.pt").write_bytes(b"weights")
+            with (
+                mock.patch(
+                    "audio_sound.bootstrap._inspect_python_runtime",
+                    return_value={
+                        "ok": True,
+                        "path": "python",
+                        "version": "3.11.9",
+                        "deepfilternet_ok": False,
+                        "respiro_runtime_ok": False,
+                        "torch_ok": True,
+                    },
+                ),
+                mock.patch("audio_sound.bootstrap.shutil.which", return_value="tool.exe"),
+            ):
+                payload = detect_runtime(repo_root=root, python_executable="python")
+
+        self.assertTrue(payload["respiro_en"]["assets"]["ok"])
+        self.assertFalse(payload["respiro_en"]["runtime"]["ok"])
+        self.assertFalse(payload["respiro_en"]["ready"])
+        self.assertFalse(payload["deepfilternet"]["ready"])
+        self.assertEqual(payload["python"]["supported"], True)
+
     def test_build_install_commands_include_breath_first_stack(self) -> None:
         commands = build_install_commands(repo_root="S:/Agent/Auto jianji/Audio-sound", python_executable="python")
         flattened = [" ".join(command) for command in commands]

@@ -1,0 +1,29 @@
+{
+  "name": "model-combined-review",
+  "description": "Combined Respiro and DeepFilterNet review candidate requiring dual ASR evidence.",
+  "notes": ["Generated only after both single-model candidates pass their hard guards."],
+  "pipeline": {
+    "stages": [
+      {"type": "respiro", "enabled": true, "threshold": 0.08, "min_length_ms": 24},
+      {"type": "spectramini", "enabled": true, "breath_control_reduction": 0.2, "breath_control_sensitivity": 0.35, "mouth_declick_sensitivity": 0.0},
+      {"type": "deepfilternet", "enabled": true, "module": "df.enhance", "post_filter": false}
+    ]
+  },
+  "extract": {"sample_rate": 48000, "channels": 1, "pcm_codec": "pcm_s16le"},
+  "filters": {
+    "highpass_hz": 55,
+    "lowpass_hz": null,
+    "secondary_denoise": {"enabled": false, "nr": 6, "nf": -32, "tracking": false},
+    "declick": {"enabled": false, "window": 55, "overlap": 75, "arorder": 2, "threshold": 2.2, "burst": 2.0},
+    "nonlinear_denoise": {"enabled": false, "strength": 0.01, "patch": 0.002, "research": 0.006, "smooth": 11},
+    "deesser": {"enabled": false, "intensity": 0.08, "max_deessing": 0.3, "frequency": 0.46},
+    "gate": {"enabled": false, "threshold": 0.01, "ratio": 1.2, "attack_ms": 25, "release_ms": 300, "makeup_db": 0},
+    "compressor": {"enabled": true, "threshold_db": -16, "ratio": 1.25, "attack_ms": 30, "release_ms": 300, "makeup_db": 0},
+    "speech_norm": {"enabled": false, "expansion": 1.0, "raise": 0.0005, "fall": 0.0005, "threshold": 0.0},
+    "breath_onset_cleanup": {"enabled": false, "fade_ms": 14.0},
+    "pause_residual_cleanup": {"enabled": false},
+    "loudnorm": {"target_i": -19.0, "target_lra": 11.0, "target_tp": -3.0}
+  },
+  "analysis": {"silence_candidates": false, "silence_threshold_db": -40, "silence_min_duration": 0.15},
+  "transcript_export": {"codec": "libmp3lame", "bitrate": "192k"}
+}
