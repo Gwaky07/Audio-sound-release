@@ -13,6 +13,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .console import configure_utf8_stdio
 from .pipeline import NoiseWindow, duck_audio_file_in_place
 
 
@@ -149,6 +150,7 @@ def apply_exact_windows(
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_utf8_stdio()
     args = build_parser().parse_args(argv)
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()

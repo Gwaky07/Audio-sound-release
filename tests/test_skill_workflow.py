@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 import unittest
 from array import array
 from pathlib import Path
@@ -30,6 +34,24 @@ from audio_sound.skill_workflow import (
 
 
 class SkillWorkflowTests(unittest.TestCase):
+    def test_describe_modes_emits_utf8_under_legacy_parent_encoding(self) -> None:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp1252"
+        code = (
+            "from audio_sound.skill_workflow import main; "
+            "raise SystemExit(main(['describe-modes','--mode','auto']))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+        )
+        error_text = result.stderr.decode("utf-8", errors="replace")
+        self.assertEqual(result.returncode, 0, error_text)
+        payload = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(payload["suffix"], describe_modes("auto")["suffix"])
+
     def test_auto_dry_run_loads_required_candidates_and_capability_plan(self) -> None:
         payload = build_workflow_dry_run(Path("placeholder.wav"), "auto")
 

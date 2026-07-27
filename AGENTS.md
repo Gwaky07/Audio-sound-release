@@ -10,7 +10,7 @@ Windows 最终交付优先使用固定到仓库 `.venv` 的入口：
 run_audio_workflow.cmd "<input-audio>"
 ```
 
-只有明确传入 `.venv\Scripts\python.exe` 时，才直接运行 `python scripts/audio_skill_workflow.py run "<input-audio>"`。
+只有明确传入仓库解释器时，才直接运行 `.\.venv\Scripts\python.exe scripts\audio_skill_workflow.py run "<input-audio>"`。
 
 The default workflow mode is `auto`. Under repair intent it pursues **Best Repair**: build a `natural` safety baseline, always compete the whitelist candidate `final_repair_best` (preset `final`), optionally compete evidence-gated model candidates, and auto-deliver only when hard gates pass. `natural` is only an incomplete fallback when enhancement fails gates — never a completed repair result.
 
@@ -44,6 +44,7 @@ Preserve the source sample rate, channel count, and stereo layout by default. Mu
 - `final` 也必须按输入证据避免已知伤害：当 `stationary_noise=false` 且 `estimated_snr_db>=35` 时，自动关闭整段 `afftdn` secondary denoise，并记录 `input_adaptations=["skip_secondary_denoise_clean_source"]`。这类清洁源仍保留 Respiro 局部呼吸处理、清晰度 EQ、去齿音和稳量，不能用有害整段降噪凑处理阶段。
 - `mouth_declick_sensitivity=0` 必须表示完全关闭全局 mouth-declick，不能仍扫描并插值整段语音。未确认口水音/爆点窗口时，`final` 默认关闭全局 mouth-declick；确认后只允许窄窗口修复。
 - `final` 的呼吸清理必须使用闭环：保留不可变 `raw_wav`，分别记录 Respiro、辅助停顿边缘检测和噪声型频谱证据；只处理位于语音起点之前且呈噪声型的窗口。首轮目标为 `min(邻域底噪 + target_margin_db, absolute_floor_dbfs)`（默认 margin `-6`、绝对地板 `-66 dBFS`），避免“邻域被语音拖尾抬高 → 轻吸气已低于邻域 → 0 dB 衰减却仍可听见”。母带后复检并做最多两次窄窗口补处理，最后仍高于该目标超过 `residual_min_excess_db` 的确认残留以 `confirmed_breath_residual_after_retry` 阻止交付。
+- 句首到第一处活跃语音起点之前的轻噪声/气口，必须在母带/`loudnorm` 前封到静音地板，并在母带后再做一次安全封印；禁止把原片不可闻的轻噪声动态抬成可听轰鸣。质量守门必须能以 `pre_speech_soft_noise_boosted` 拦截“源轻噪声被放大成可听能量”的交付。
 - “运行了 Respiro”或“窗口已衰减”不等于呼吸清理完成。报告必须包含 `breath_cleanup.status=PASS`、空的 `final_residual_windows`、实际处理窗口及授权排除窗口；残留检测失败或未验证时不得宣称干净。
 - 呼吸窗口允许从 preservation 频谱/增益比较中排除，但仅限报告中记录且通过语音保护授权的窗口；其他所有语音仍必须通过吞字、相关性、频谱和增益稳定守门。不得用排除窗口掩盖整段伤害。
 - 对比呼吸清理前后频谱时必须使用相同 dB 范围和颜色刻度。紫色/黑色只代表较低能量，不能仅凭自动缩放后的颜色宣称清理完成。
@@ -109,7 +110,7 @@ verify_delivery.cmd --source "<source>" --final-wav "<delivered.wav>" --final-mp
 Before processing audio on a fresh machine, check the runtime:
 
 ```powershell
-python scripts/audio_cleanup.py doctor
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py doctor
 ```
 
 If dependencies are missing, run:
@@ -118,10 +119,10 @@ If dependencies are missing, run:
 setup.cmd
 ```
 
-For release packages that include `tools/Respiro-en`, `tools/respiro-en.pt`, and `ffmpeg/`, use the package-local `.env`. If Respiro assets are not present, run:
+Clean-source release packages do not include `tools/Respiro-en`, `tools/respiro-en.pt`, or `ffmpeg/`. If Respiro assets are required, run:
 
 ```powershell
-python scripts/audio_cleanup.py setup-respiro
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py setup-respiro
 ```
 
 Do not claim Respiro-en, DeepFilterNet, or SpectraMini were used unless `doctor` or the workflow report shows they are actually available. If the workflow falls back to heuristic processing, say so.
@@ -176,7 +177,7 @@ Do not claim Respiro-en, DeepFilterNet, or SpectraMini were used unless `doctor`
 4. **测试门禁**：`.github/workflows/ci.yml` 必须在 Python 3.10 / 3.11 跑全量 `pytest`，并在隔离 wheel 环境用合成口播样本真实执行一次无模型 `final` 确定性链，生成 WAV/MP3、确认格式保持，再做独立 pair guard PASS 与 `audio-verify-delivery` 冒烟。不得把完整 `setup.cmd`（含 torch / Respiro 资产）当作 CI 阻断步骤。
 5. **运行时诊断门禁**：CI 必须解析 `doctor`，确认 Python 受支持且 Respiro / DeepFilterNet capability state 字段存在。缺少 bundled `tools/`、仓库内 `ffmpeg/`、模型权重时，模型 `ready=false` 是可接受事实，但不得伪造 ready，也不得让无模型单元测试失败。
 6. **对比与验证模块**：`scripts/evaluate_audio_pair.py` 是薄入口，核心在 `audio_sound/pair_evaluation.py`；独立无排除对比与 `verify_delivery` 不得传授权排除窗口来“洗绿”报告。`quality_guard.release_blocked` 缺失时必须 fail-closed 视为 `True`；测试与 CI 必须锁住该默认。
-7. **禁止提交**：`.venv/`、`.env`、`tools/`、`output/`、`scratch/`、`.omx/`、`__pycache__/`、`*.egg-info/`；分享前可跑 `python scripts/audio_cleanup.py clean-repo`。
+7. **禁止提交**：`.venv/`、`.env`、`tools/`、`output/`、`scratch/`、`.omx/`、`__pycache__/`、`*.egg-info/`；分享前可跑 `.\.venv\Scripts\python.exe scripts\audio_cleanup.py clean-repo`。
 
 ## Enforcement Map
 
@@ -286,7 +287,7 @@ Truthful status reporting is a release-blocking requirement. Never convert an as
 12. If a Feishu section contains an unsupported `PASS`, `complete`, or `以此版为准` claim, invalidate that claim visibly before continuing. Keep the old media only as a clearly labeled failed reference until a verified replacement is uploaded and hash-checked.
 13. When the same or near-identical spoken passage occurs more than once, enumerate every source occurrence and every mapped final-media occurrence before choosing a cut. A successful cut of one occurrence does not satisfy the requirement while another matching occurrence remains at a user-reported final timestamp.
 14. Normalize ASR and document text before forbidden-phrase scanning, including Unicode normalization, Simplified/Traditional Chinese conversion, punctuation removal, and explicitly reviewed pronoun or homophone variants. If raw ASR contains a target such as `它實踐` while the normalized scanner reports `它实践` absent, the audit is contradictory and must fail closed.
-15. For every red-text deletion, repeated/near-identical passage, homophone, or user-reported final-media timestamp, run `python scripts/audit_spoken_release.py run ...` before upload. The requirement JSON must enumerate every source occurrence, identify remove/retain intent, protect required retained contexts, and include each user-reported final timestamp. Each final ASR JSON must identify the exact audited media through `media` or `media_sha256`, and that hash must match a `--final-media` file. A nonzero exit code, `release_blocked=true`, an undeclared source ASR occurrence, a missing retained context, an unchecked timestamp, or an unbound ASR pass blocks release; do not replace this gate with a hand-written summary.
+15. For every red-text deletion, repeated/near-identical passage, homophone, or user-reported final-media timestamp, run `.\.venv\Scripts\python.exe scripts\audit_spoken_release.py run ...` before upload. The requirement JSON must enumerate every source occurrence, identify remove/retain intent, protect required retained contexts, and include each user-reported final timestamp. Each final ASR JSON must identify the exact audited media through `media` or `media_sha256`, and that hash must match a `--final-media` file. A nonzero exit code, `release_blocked=true`, an undeclared source ASR occurrence, a missing retained context, an unchecked timestamp, or an unbound ASR pass blocks release; do not replace this gate with a hand-written summary.
 
 ## Keep Out Of Git
 
@@ -304,7 +305,7 @@ Do not commit local runtime assets or generated outputs:
 Before sharing source, run:
 
 ```powershell
-python scripts/audio_cleanup.py clean-repo
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py clean-repo
 ```
 
 ## External Verification Boundaries

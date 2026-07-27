@@ -1,14 +1,15 @@
 ﻿# Audio-sound 发布包快速开始
 
-发布包包含仓库源码、Codex skill、ffmpeg、Respiro-en 和 `respiro-en.pt`，不包含 Python 虚拟环境。
+GitHub 的 clean-source 分享包只包含仓库源码、Codex skill 和配置文件，不包含 Python 虚拟环境、`ffmpeg/`、`tools/`、模型权重或任何用户音频。
 
 在接收端 Windows 机器上：
 
-1. 安装 Python 3.11 或 3.10。Python 3.12 及以上版本不受封装模型支持。
-2. 在本目录打开 PowerShell 或 Command Prompt。
-3. 运行 `setup.cmd`。脚本优先使用 Python 3.11，其次使用 3.10，并创建仓库专用 `.venv`。
-4. 运行 `check_runtime.cmd` 或 `doctor.cmd`。
-5. 使用以下命令处理音频：
+1. 安装 Python 3.11 或 3.10。Python 3.12 及以上版本不受支持。
+2. 安装系统级 FFmpeg，确保 `ffmpeg` 和 `ffprobe` 可从 `PATH` 调用；也可以手动放入本目录的 `ffmpeg\bin`。
+3. 在本目录打开 PowerShell 或 Command Prompt。
+4. 运行 `setup.cmd`。脚本优先使用 Python 3.11，其次使用 3.10，并创建仓库专用 `.venv`。
+5. 运行 `check_runtime.cmd` 或 `doctor.cmd`。
+6. 使用以下命令处理音频：
 
 ```bat
 run_audio_workflow.cmd "D:\audio\raw-voice.wav"
@@ -28,14 +29,15 @@ output\修音成品\
 run_audio_workflow.cmd "D:\audio\raw-voice.wav" --keep-intermediate-audio
 ```
 
-辅助脚本会把发布包的 `ffmpeg\bin` 加入 `PATH`，接收端不需要安装系统级 ffmpeg。
+辅助脚本会优先把本地 `ffmpeg\bin` 加入 `PATH`，但 clean-source 包不会内置 FFmpeg；未手动放入时必须使用系统安装版本。
 
-发布包 `.env` 指向：
+不安装可选模型时，确定性的 `final` 修音链仍可运行。需要启用 Respiro 候选时，执行：
 
-- `tools\Respiro-en`
-- `tools\respiro-en.pt`
+```bat
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py setup-respiro
+```
 
-`doctor` 会分别报告 Python 版本、Respiro 资产、Respiro 依赖、Respiro 权重加载和 DeepFilterNet 导入状态。任一项不可用时，重新运行 `setup.cmd` 并检查 Python 版本。
+该命令会在本机准备 `tools\Respiro-en` 和 `tools\respiro-en.pt`；这些资产不会进入分享包。`doctor` 会分别报告 Python 版本、FFmpeg、Respiro 资产、Respiro 依赖、Respiro 权重加载和 DeepFilterNet 导入状态。模型不可用时会记录真实能力状态，不会阻止无模型确定性链运行。
 
 默认 `auto` 不会无条件串行使用模型。它根据输入诊断生成固定安全候选：
 

@@ -114,9 +114,10 @@ jobs:
         run: |
           $venv = Join-Path $env:RUNNER_TEMP "wheel-venv"
           $python = Join-Path $venv "Scripts\python.exe"
-          $cleanup = Join-Path $venv "Scripts\audio-cleanup.exe"
+          $workflow = Join-Path $venv "Scripts\audio-skill-workflow.exe"
           $sample = Join-Path $env:RUNNER_TEMP "ci-speech.wav"
           $output = Join-Path $env:RUNNER_TEMP "ci-real-chain"
+          $delivery = Join-Path $env:RUNNER_TEMP "ci-delivery"
           @'
           import math, struct, sys, wave
           sample = sys.argv[1]
@@ -150,18 +151,22 @@ jobs:
                   struct.pack("<" + "h" * len(samples), *samples)
               )
           '@ | & $python - $sample
-          & $cleanup clean $sample --preset final --skip-spectramini --skip-deepfilternet --output-dir $output
-          $report = Get-ChildItem $output -Recurse -Filter "audio_process_report.json" | Select-Object -First 1
+          & $workflow run $sample --mode final --output-dir $output --delivery-dir $delivery --skip-spectrograms
+          if ($LASTEXITCODE -ne 0) { throw "real final workflow failed" }
+          $report = Get-ChildItem $output -Recurse -Filter "skill-file-report.json" | Select-Object -First 1
           if (-not $report) { throw "real-chain report was not generated" }
           $payload = Get-Content $report.FullName -Raw | ConvertFrom-Json
+          $core = $payload.core_report
           if ($payload.dry_run) { throw "real chain unexpectedly used dry-run" }
-          if ($payload.preset_name -ne "final") { throw "final preset was not used" }
-          if (-not $payload.channel_layout_preserved) { throw "channel layout changed" }
-          if (-not (Test-Path $payload.outputs.clean_wav)) { throw "final WAV is missing" }
-          if (-not (Test-Path $payload.outputs.transcript_mp3)) { throw "final MP3 is missing" }
+          if ($core.preset_name -ne "final") { throw "final preset was not used" }
+          if ($core.quality_guard.status -ne "PASS") { throw "internal quality guard failed" }
+          if ($core.repair_scorecard.status -ne "PASS") { throw "repair scorecard failed" }
+          if ($core.delivery_incomplete_for_repair_intent) { throw "repair delivery marked incomplete" }
+          if (-not (Test-Path $payload.deliverables.wav)) { throw "final WAV is missing" }
+          if (-not (Test-Path $payload.deliverables.mp3)) { throw "final MP3 is missing" }
           $pair = Join-Path $env:RUNNER_TEMP "ci-pair.json"
           $source = $sample
-          $processed = $payload.outputs.clean_wav
+          $processed = $payload.deliverables.wav
           @'
           import json, sys
           from pathlib import Path
@@ -179,41 +184,15 @@ jobs:
           '@ | & $python - $source $processed $pair
           $verifyReport = Join-Path $env:RUNNER_TEMP "ci-verify-report.json"
           $verifyOut = Join-Path $env:RUNNER_TEMP "ci-delivery-verification.json"
-          $mp3 = $payload.outputs.transcript_mp3
-          @'
-          import json, sys
-          from pathlib import Path
-          source, wav, mp3, process_report, verify_report = map(Path, sys.argv[1:6])
-          payload = json.loads(process_report.read_text(encoding="utf-8"))
-          payload["quality_guard"] = {
-              "status": "PASS",
-              "release_blocked": False,
-              "failures": [],
-          }
-          payload["breath_cleanup"] = {
-              "status": "PASS",
-              "final_residual_windows": [],
-              "failures": [],
-          }
-          payload["pause_cleanup"] = {
-              "status": "PASS",
-              "mode": "speech_safe_autogate",
-              "allow_bridge_windows": False,
-              "final_residual_windows": [],
-              "failures": [],
-          }
-          payload["deliverables"] = {"wav": str(wav), "mp3": str(mp3)}
-          verify_report.write_text(
-              json.dumps(payload, ensure_ascii=False, indent=2),
-              encoding="utf-8",
-          )
-          '@ | & $python - $source $processed $mp3 $report.FullName $verifyReport
+          $mp3 = $payload.deliverables.mp3
+          Copy-Item -LiteralPath $report.FullName -Destination $verifyReport -Force
           & (Join-Path $venv "Scripts\audio-verify-delivery.exe") `
             --source $source `
             --final-wav $processed `
             --final-mp3 $mp3 `
             --report $verifyReport `
-            --output $verifyOut
+            --output $verifyOut `
+            --repair-intent
           $manifest = Get-Content $verifyOut -Raw | ConvertFrom-Json
           if ($manifest.status -ne "PASS") { throw "audio-verify-delivery smoke failed" }
           if ($manifest.release_blocked) { throw "audio-verify-delivery unexpectedly blocked" }
@@ -246,27 +225,28 @@ jobs:
             $broken = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name).json"
             $out = Join-Path $env:RUNNER_TEMP "ci-broken-$($mutation.name)-manifest.json"
             $brokenPayload = Get-Content $passReport -Raw | ConvertFrom-Json
+            $core = $brokenPayload.core_report
             switch ($mutation.name) {
               "release_blocked_true" {
-                $brokenPayload.quality_guard.release_blocked = $true
+                $core.quality_guard.release_blocked = $true
               }
               "release_blocked_absent" {
-                $brokenPayload.quality_guard.PSObject.Properties.Remove("release_blocked")
+                $core.quality_guard.PSObject.Properties.Remove("release_blocked")
               }
               "quality_guard_absent" {
-                $brokenPayload.PSObject.Properties.Remove("quality_guard")
+                $core.PSObject.Properties.Remove("quality_guard")
               }
               "guard_failures_present" {
-                $brokenPayload.quality_guard.failures = @("spectral_clarity_lost")
+                $core.quality_guard.failures = @("spectral_clarity_lost")
               }
               "breath_residual_present" {
-                $brokenPayload.breath_cleanup.final_residual_windows = @(@(1.0, 1.2))
+                $core.breath_cleanup.final_residual_windows = @(@(1.0, 1.2))
               }
               "pause_mode_invalid" {
-                $brokenPayload.pause_cleanup.mode = "legacy_hard_gate"
+                $core.pause_cleanup.mode = "legacy_hard_gate"
               }
               "pause_bridge_enabled" {
-                $brokenPayload.pause_cleanup.allow_bridge_windows = $true
+                $core.pause_cleanup.allow_bridge_windows = $true
               }
               default {
                 throw "unknown mutation '$($mutation.name)'"
@@ -276,7 +256,7 @@ jobs:
               Set-Content -LiteralPath $broken -Encoding utf8
 
             & $verify --source $sample --final-wav $wav --final-mp3 $mp3 `
-              --report $broken --output $out
+              --report $broken --output $out --repair-intent
             $code = $LASTEXITCODE
             if ($code -eq 0) {
               throw "mutation '$($mutation.name)' was NOT blocked (exit 0)"

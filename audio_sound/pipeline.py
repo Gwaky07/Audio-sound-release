@@ -634,6 +634,104 @@ def apply_adaptive_breath_cleanup(
     return cleaned, details
 
 
+def detect_first_speech_onset_seconds(
+    samples: array,
+    *,
+    sample_rate: int,
+    channels: int = 1,
+    threshold_dbfs: float = -35.0,
+    min_hold_ms: float = 50.0,
+    frame_ms: float = 10.0,
+) -> float | None:
+    """Return the first sustained active-speech onset in seconds."""
+    if sample_rate <= 0 or channels <= 0 or not samples:
+        return None
+    frame = max(1, int(sample_rate * (frame_ms / 1000.0)))
+    hold_frames = max(1, int(math.ceil(min_hold_ms / max(frame_ms, 1.0))))
+    total_frames = len(samples) // channels
+    run = 0
+    run_start_frame = 0
+    for start_frame in range(0, max(0, total_frames - frame + 1), frame):
+        chunk = samples[
+            start_frame * channels : (start_frame + frame) * channels
+        ]
+        if not chunk:
+            continue
+        level = _amplitude_to_dbfs(_compute_rms(chunk))
+        if level >= threshold_dbfs:
+            if run == 0:
+                run_start_frame = start_frame
+            run += 1
+            if run >= hold_frames:
+                return run_start_frame / float(sample_rate)
+        else:
+            run = 0
+    return None
+
+
+def detect_pre_speech_soft_noise_boost_windows(
+    reference_samples: array,
+    processed_samples: array,
+    *,
+    sample_rate: int,
+    frame_ms: float = 20.0,
+    speech_threshold_dbfs: float = -35.0,
+    source_quiet_dbfs: float = -40.0,
+    processed_audible_dbfs: float = -55.0,
+    max_boost_db: float = 12.0,
+    hold_pad_ms: float = 45.0,
+    min_duration_ms: float = 40.0,
+) -> list[dict[str, Any]]:
+    """Flag pre-speech regions where mastering boosted soft source noise."""
+    onset = detect_first_speech_onset_seconds(
+        reference_samples,
+        sample_rate=sample_rate,
+        channels=1,
+        threshold_dbfs=speech_threshold_dbfs,
+        min_hold_ms=50.0,
+        frame_ms=10.0,
+    )
+    if onset is None:
+        return []
+    limit_seconds = max(0.0, float(onset) - (float(hold_pad_ms) / 1000.0))
+    if limit_seconds <= 0.05:
+        return []
+    frame = max(1, int(sample_rate * (frame_ms / 1000.0)))
+    limit_index = int(limit_seconds * sample_rate)
+    mask: list[bool] = []
+    for start in range(0, max(0, limit_index - frame + 1), frame):
+        ref = reference_samples[start : start + frame]
+        proc = processed_samples[start : start + frame]
+        if not ref or not proc:
+            mask.append(False)
+            continue
+        ref_db = _amplitude_to_dbfs(_compute_rms(ref))
+        proc_db = _amplitude_to_dbfs(_compute_rms(proc))
+        boost = proc_db - ref_db
+        mask.append(
+            ref_db <= source_quiet_dbfs
+            and proc_db >= processed_audible_dbfs
+            and boost >= max_boost_db
+        )
+    windows: list[dict[str, Any]] = []
+    start_index: int | None = None
+    for index, flagged in enumerate(mask + [False]):
+        if flagged and start_index is None:
+            start_index = index
+        elif not flagged and start_index is not None:
+            duration_ms = (index - start_index) * frame_ms
+            if duration_ms >= min_duration_ms:
+                windows.append(
+                    {
+                        "start_seconds": round(start_index * frame_ms / 1000.0, 3),
+                        "end_seconds": round(index * frame_ms / 1000.0, 3),
+                        "duration_ms": round(duration_ms, 1),
+                    }
+                )
+            start_index = None
+    return windows
+
+
 def match_residual_breath_windows(
     *,
     parent_windows: list[NoiseWindow],
@@ -2051,6 +2149,9 @@ def compare_audio_preservation(
         "spectral_max_loss_db_8_12k": 4.0,
         "spectral_max_gain_db_2_12k": 3.0,
         "spectral_max_gain_db_12_16k": 3.0,
+        "pre_speech_max_boost_db": 12.0,
+        "pre_speech_source_quiet_dbfs": -40.0,
+        "pre_speech_processed_audible_dbfs": -55.0,
     }
     reference_format = reference_format or {}
     processed_format = processed_format or {}
@@ -2123,6 +2224,20 @@ def compare_audio_preservation(
             if band_name == "12-16k" and delta_db > thresholds["spectral_max_gain_db_12_16k"]:
                 failures.append("spectral_harshness_increased")
                 break
+        # Evaluate against the true delivery samples — authorized cleanup
+        # exclusions must not wash out a loudnorm pre-speech boom.
+        pre_speech_boost_windows = detect_pre_speech_soft_noise_boost_windows(
+            reference_samples,
+            processed_samples,
+            sample_rate=sample_rate,
+            source_quiet_dbfs=thresholds["pre_speech_source_quiet_dbfs"],
+            processed_audible_dbfs=thresholds["pre_speech_processed_audible_dbfs"],
+            max_boost_db=thresholds["pre_speech_max_boost_db"],
+        )
+        if pre_speech_boost_windows:
+            failures.append("pre_speech_soft_noise_boosted")
+    else:
+        pre_speech_boost_windows = []
 
     failures = list(dict.fromkeys(failures))
     return {
@@ -2138,6 +2253,7 @@ def compare_audio_preservation(
         "excluded_window_count": len(resolved_excluded_windows),
         "thresholds": thresholds,
         "hard_mute_windows": hard_mute_windows,
+        "pre_speech_boost_windows": pre_speech_boost_windows,
         "spectral_band_deltas_db": spectral_band_deltas_db,
         "failures": failures,
         "release_blocked": bool(failures),
@@ -2813,11 +2929,45 @@ def _run_pause_cleanup(
         {},
     )
     if pause_residual_cleanup.get("enabled"):
-        silence_candidates = detect_silence_candidates(
+        processed_silence_candidates = detect_silence_candidates(
             layout.clean_wav,
             ffmpeg_bin=runtime.ffmpeg_bin,
             threshold_db=float(pause_residual_cleanup["silence_threshold_db"]),
             min_duration=float(pause_residual_cleanup["silence_min_duration"]),
+        )
+        source_silence_candidates = (
+            detect_silence_candidates(
+                layout.raw_wav,
+                ffmpeg_bin=runtime.ffmpeg_bin,
+                threshold_db=float(pause_residual_cleanup["silence_threshold_db"]),
+                min_duration=float(pause_residual_cleanup["silence_min_duration"]),
+            )
+            if layout.raw_wav.exists()
+            else []
+        )
+        merged_silence_windows = merge_noise_windows(
+            [
+                NoiseWindow(
+                    start_seconds=float(item["start_seconds"]),
+                    end_seconds=float(item["end_seconds"]),
+                )
+                for item in [*source_silence_candidates, *processed_silence_candidates]
+            ],
+            max_gap_seconds=0.02,
+        )
+        silence_candidates = [
+            {
+                "start_seconds": window.start_seconds,
+                "end_seconds": window.end_seconds,
+                "duration_seconds": window.end_seconds - window.start_seconds,
+            }
+            for window in merged_silence_windows
+        ]
+        report["pause_cleanup"]["source_silence_candidate_count"] = len(
+            source_silence_candidates
+        )
+        report["pause_cleanup"]["processed_silence_candidate_count"] = len(
+            processed_silence_candidates
         )
         params, samples = _load_wave_samples(layout.clean_wav)
         total_duration_seconds = (
@@ -3138,6 +3288,10 @@ def _run_breath_residual_cleanup(
     authorized_cleanup_windows = (
         list(breath_windows) if breath_cleanup_policy.get("enabled") else []
     )
+    if breath_cleanup_policy.get("enabled") and not breath_windows:
+        report["breath_cleanup"]["status"] = "PASS"
+        report["breath_cleanup"]["reason"] = "no_authorized_breath_windows"
+        return authorized_cleanup_windows
     if breath_cleanup_policy.get("enabled") and breath_windows:
         residual_windows = detect_breath_onset_windows(
             layout.clean_wav,
@@ -3510,6 +3664,14 @@ def process_media_file(
             "after": None,
             "preserve_channels": True,
         },
+        "leading_pre_speech_seal": {
+            "status": "NOT_APPLICABLE",
+            "stage": None,
+        },
+        "leading_pre_speech_seal_post": {
+            "status": "NOT_APPLICABLE",
+            "stage": None,
+        },
         "input_diagnostics": None,
         "output_diagnostics": None,
         "quality_guard": None,
@@ -3783,7 +3945,6 @@ def process_media_file(
         commands=commands,
         executed=executed,
     )
-
     breath_onset_cleanup = preset.get("filters", {}).get("breath_onset_cleanup", {})
     if breath_onset_cleanup.get("enabled"):
         breath_windows = detect_breath_onset_windows(

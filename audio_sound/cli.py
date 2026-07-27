@@ -13,6 +13,7 @@ from .bootstrap import (
     run_install,
     run_respiro_setup,
 )
+from .console import configure_utf8_stdio
 from .config import PROJECT_ROOT, apply_runtime_overrides, list_presets, load_env_file, load_preset, resolve_repo_python
 from .pipeline import (
     NoiseWindow,
@@ -235,6 +236,7 @@ def command_clean(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
 

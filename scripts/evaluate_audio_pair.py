@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from audio_sound.console import configure_utf8_stdio
 from audio_sound.pair_evaluation import evaluate_audio_pair
 
 
@@ -26,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_utf8_stdio()
     args = build_parser().parse_args(argv)
     report = evaluate_audio_pair(
         source=Path(args.source),

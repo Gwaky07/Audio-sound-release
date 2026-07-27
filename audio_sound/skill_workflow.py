@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .console import configure_utf8_stdio
 from .config import PROJECT_ROOT, resolve_repo_python
 from .media_utils import (
     export_mp3,
@@ -2046,6 +2047,7 @@ def _load_asr_payload(path: Path) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "describe-modes":
