@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .console import configure_utf8_stdio
 from .media_utils import sha256_file
 
 
@@ -790,6 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_utf8_stdio()
     args = build_parser().parse_args(argv)
     if args.command != "run":
         raise ValueError(f"Unsupported command: {args.command}")

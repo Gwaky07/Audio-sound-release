@@ -78,6 +78,29 @@ class DeliveryVerifierTests(unittest.TestCase):
             self.assertFalse(manifest["release_blocked"])
             self.assertEqual(len(manifest["artifacts"]["final_wav"]["sha256"]), 64)
 
+    def test_verify_delivery_accepts_utf8_bom_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source.wav"
+            final_wav = root / "final.wav"
+            report = root / "audio_process_report.json"
+            source.write_bytes(b"source")
+            final_wav.write_bytes(b"wav")
+            report.write_text(
+                json.dumps(_valid_report(), ensure_ascii=False),
+                encoding="utf-8-sig",
+            )
+
+            manifest = verify_delivery(
+                source=source,
+                final_wav=final_wav,
+                report_json=report,
+                pair_evaluator=_pair_pass,
+                probe=_probe,
+            )
+
+            self.assertEqual(manifest["status"], "PASS")
+
     def test_verify_delivery_fails_closed_when_release_blocked_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -217,6 +240,37 @@ class DeliveryVerifierTests(unittest.TestCase):
             payload = _valid_report()
             payload["deliverables"] = {"wav": str(other_wav)}
             report.write_text(json.dumps(payload), encoding="utf-8")
+
+            manifest = verify_delivery(
+                source=source,
+                final_wav=final_wav,
+                report_json=report,
+                pair_evaluator=_pair_pass,
+                probe=_probe,
+            )
+
+            self.assertEqual(manifest["status"], "FAIL")
+            self.assertIn("report_final_wav_mismatch", manifest["failures"])
+
+    def test_verify_delivery_blocks_wrapper_deliverable_path_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source.wav"
+            final_wav = root / "final.wav"
+            other_wav = root / "other.wav"
+            report = root / "skill-file-report.json"
+            source.write_bytes(b"source")
+            final_wav.write_bytes(b"wav")
+            other_wav.write_bytes(b"other")
+            report.write_text(
+                json.dumps(
+                    {
+                        "core_report": _valid_report(),
+                        "deliverables": {"wav": str(other_wav)},
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             manifest = verify_delivery(
                 source=source,

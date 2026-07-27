@@ -71,36 +71,36 @@
 
 ## 快速开始
 
-检查运行环境：
-
-```bash
-python scripts/audio_cleanup.py doctor
-```
-
-Windows 下初始化本地环境：
+先初始化仓库专用环境：
 
 ```bat
 setup.cmd
 ```
 
+再检查运行环境：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py doctor
+```
+
 列出可用预设：
 
-```bash
-python scripts/audio_cleanup.py list-presets
+```powershell
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py list-presets
 ```
 
 检查单个音频文件：
 
-```bash
-python scripts/audio_cleanup.py inspect "D:/audio/raw-voice.wav"
+```powershell
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py inspect "D:/audio/raw-voice.wav"
 ```
 
 ## 推荐成品流程
 
 默认最终交付请使用：
 
-```bash
-python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav"
+```powershell
+run_audio_workflow.cmd "D:\audio\raw-voice.wav"
 ```
 
 默认模式是 `auto`。该流程会：
@@ -120,14 +120,14 @@ python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav"
 
 只想跑自然基线时：
 
-```bash
-python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --mode natural
+```powershell
+run_audio_workflow.cmd "D:\audio\raw-voice.wav" --mode natural
 ```
 
 同源前后对比：
 
-```bash
-python scripts/evaluate_audio_pair.py --source "D:/audio/raw.wav" --processed "D:/audio/processed.wav" --output "scratch/pair-report.json"
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_audio_pair.py --source "D:/audio/raw.wav" --processed "D:/audio/processed.wav" --output "scratch/pair-report.json"
 ```
 
 最终交付独立验证：
@@ -151,14 +151,14 @@ verify_delivery.cmd --source "D:/audio/raw.wav" --final-wav "output/修音成品
 
 当目标是删除一句话、口误、重复字或指定时间段时，不要只做降噪，应使用物理删词脚本：
 
-```bash
-python scripts/remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
+```powershell
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
 ```
 
 多个片段可以重复传入 `--cut`：
 
-```bash
-python scripts/remove_spoken_segments.py run "D:/video/第六段.mp4" --cut "0.00,1.80" --cut "2.10,2.34" --removed-phrase "删除口误"
+```powershell
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run "D:/video/第六段.mp4" --cut "0.00,1.80" --cut "2.10,2.34" --removed-phrase "删除口误"
 ```
 
 默认删词规则：
@@ -169,8 +169,8 @@ python scripts/remove_spoken_segments.py run "D:/video/第六段.mp4" --cut "0.0
 
 如果删完后仍然像“突然接上下一句/一个字”，不要继续拉长交叉淡化，改用语音安全接缝：
 
-```bash
-python scripts/remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊" --seam-pause-ms 80
+```powershell
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run "D:/video/第二段.mp4" --cut "0.62,1.82" --removed-phrase "啊说德语啊" --seam-pause-ms 80
 ```
 
 `--seam-pause-ms 60–100` 会让前句淡出、短暂停顿、下一句淡入，并在视频上冻结上一帧同等时长。
@@ -206,8 +206,8 @@ Codex/GPT 可以读取诊断报告、选择固定白名单候选、输出 `capab
 
 示例：
 
-```bash
-python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --preset voice-isolate --noise-window 143.089208:144.093687
+```powershell
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py clean "D:/audio/raw-voice.wav" --preset voice-isolate --noise-window 143.089208:144.093687
 ```
 
 ## 输出目录
@@ -223,8 +223,8 @@ python scripts/audio_cleanup.py clean "D:/audio/raw-voice.wav" --preset voice-is
 
 排查时如需保留中间音频：
 
-```bash
-python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --keep-intermediate-audio
+```powershell
+run_audio_workflow.cmd "D:\audio\raw-voice.wav" --keep-intermediate-audio
 ```
 
 ## Codex 使用规则
@@ -237,9 +237,15 @@ python scripts/audio_skill_workflow.py run "D:/audio/raw-voice.wav" --keep-inter
 
 在本仓库中，如果用户要求“处理音频”“修一下音频”“剪掉这句”“边界有残留”，Codex 应默认理解为最终可交付任务，而不是简单预览。
 
+可直接在 Codex 中输入：
+
+```text
+使用 $audio-sound 处理 "D:\audio\raw-voice.wav"，按默认 auto 模式交付最终 WAV/MP3。
+```
+
 关键规则：
 
-- 默认成品入口是 `python scripts/audio_skill_workflow.py run ...`，默认模式为 `auto`。
+- 默认成品入口是 `run_audio_workflow.cmd ...`，默认模式为 `auto`；需要直接调用 Python 时必须显式使用 `.\.venv\Scripts\python.exe`。
 - 默认保留源采样率、声道数和立体声布局，分析下混不改变交付格式。
 - 自适应控制层只能选择 `baseline`、`leveling_gentle`、`noise_review`、`manual_review` 四个安全档位。
 - `auto` 只能在白名单候选中选择，不得直接生成任意 DSP 参数，也不得绕过质量守门启用破坏性处理。

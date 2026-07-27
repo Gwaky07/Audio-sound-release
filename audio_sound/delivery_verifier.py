@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from .console import configure_utf8_stdio
 from .media_utils import sha256_file
 from .pair_evaluation import evaluate_audio_pair
 from .pipeline import ffprobe_media
@@ -185,7 +186,7 @@ def verify_delivery(
             "release_blocked": True,
         }
 
-    report_payload = json.loads(report_json.read_text(encoding="utf-8"))
+    report_payload = json.loads(report_json.read_text(encoding="utf-8-sig"))
     report = _core_report(report_payload)
     failures.extend(
         _report_gate_failures(
@@ -195,14 +196,20 @@ def verify_delivery(
         )
     )
 
-    report_wav = _report_deliverable_path(report, "wav") or _report_deliverable_path(
-        report, "final_wav"
+    report_wav = (
+        _report_deliverable_path(report, "wav")
+        or _report_deliverable_path(report, "final_wav")
+        or _report_deliverable_path(report_payload, "wav")
+        or _report_deliverable_path(report_payload, "final_wav")
     )
     if report_wav is not None and not _paths_refer_same_file(report_wav, final_wav):
         failures.append("report_final_wav_mismatch")
     if final_mp3 is not None:
-        report_mp3 = _report_deliverable_path(report, "mp3") or _report_deliverable_path(
-            report, "final_mp3"
+        report_mp3 = (
+            _report_deliverable_path(report, "mp3")
+            or _report_deliverable_path(report, "final_mp3")
+            or _report_deliverable_path(report_payload, "mp3")
+            or _report_deliverable_path(report_payload, "final_mp3")
         )
         if report_mp3 is not None and not _paths_refer_same_file(report_mp3, final_mp3):
             failures.append("report_final_mp3_mismatch")
@@ -301,6 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_utf8_stdio()
     args = build_parser().parse_args(argv)
     manifest = verify_delivery(
         source=Path(args.source),

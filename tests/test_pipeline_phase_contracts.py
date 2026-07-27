@@ -67,6 +67,7 @@ class PipelinePhaseContractTests(unittest.TestCase):
     def test_pause_cleanup_fails_closed_when_assessment_windows_are_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             layout = _layout(Path(tmp_dir))
+            _write_pcm16_wav(layout.raw_wav)
             report = {
                 "pause_cleanup": {
                     "status": "NOT_APPLICABLE",
@@ -125,18 +126,21 @@ class PipelinePhaseContractTests(unittest.TestCase):
             with (
                 mock.patch(
                     "audio_sound.pipeline.detect_silence_candidates",
-                    return_value=[
-                        {
-                            "start_seconds": 0.0,
-                            "end_seconds": 1.0,
-                            "duration_seconds": 1.0,
-                        }
+                    side_effect=[
+                        [],
+                        [
+                            {
+                                "start_seconds": 0.0,
+                                "end_seconds": 1.0,
+                                "duration_seconds": 1.0,
+                            }
+                        ],
                     ],
-                ),
+                ) as detect_mock,
                 mock.patch(
                     "audio_sound.pipeline.infer_pause_residual_cleanup_windows",
                     return_value=[pause_window],
-                ),
+                ) as infer_mock,
                 mock.patch(
                     "audio_sound.pipeline.build_effective_breath_windows",
                     return_value=([pause_window], [{"decision": "accepted"}]),
@@ -173,6 +177,21 @@ class PipelinePhaseContractTests(unittest.TestCase):
                 )
 
             self.assertEqual(report["pause_cleanup"]["status"], "FAIL")
+            self.assertEqual(detect_mock.call_count, 2)
+            self.assertEqual(
+                report["pause_cleanup"]["source_silence_candidate_count"],
+                1,
+            )
+            self.assertEqual(
+                report["pause_cleanup"]["processed_silence_candidate_count"],
+                0,
+            )
+            self.assertEqual(
+                infer_mock.call_args.kwargs["silence_candidates"][0][
+                    "start_seconds"
+                ],
+                0.0,
+            )
             self.assertIn(
                 "empty_assessment_windows",
                 report["pause_cleanup"]["failures"],
@@ -265,6 +284,38 @@ class PipelinePhaseContractTests(unittest.TestCase):
                 ["confirmed_breath_residual_after_retry"],
             )
             self.assertIn(residual, authorized)
+
+    def test_breath_cleanup_passes_when_no_windows_are_authorized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report = {
+                "breath_cleanup": {
+                    "status": "NOT_APPLICABLE",
+                    "first_pass": [],
+                    "second_pass": [],
+                    "final_pass": [],
+                    "final_residual_windows": [],
+                    "failures": [],
+                }
+            }
+
+            authorized = _run_breath_residual_cleanup(
+                breath_windows=[],
+                breath_cleanup_policy={"enabled": True},
+                layout=_layout(Path(tmp_dir)),
+                runtime=RuntimeOptions(ffmpeg_bin="ffmpeg"),
+                fallback_config={},
+                input_analysis={},
+                report=report,
+                commands=[],
+                executed=[],
+            )
+
+        self.assertEqual(authorized, [])
+        self.assertEqual(report["breath_cleanup"]["status"], "PASS")
+        self.assertEqual(
+            report["breath_cleanup"]["reason"],
+            "no_authorized_breath_windows",
+        )
 
 
 if __name__ == "__main__":

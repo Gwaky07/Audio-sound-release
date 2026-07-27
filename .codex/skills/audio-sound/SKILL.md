@@ -1,6 +1,6 @@
 ---
 name: audio-sound
-description: 仓库级中文总技能。用于中文口播、课程讲解、配音、旁白、批量音频整理、删词剪辑与交付。默认以自然度、清晰度和稳定性为第一优先级：保留原始人声，只做保守母带和响度统一；呼吸、口水音、降噪、停顿残留和节点精修必须在缺陷被确认后局部启用。涉及删词时必须先做语音边界收口与音画同步验证，并把最终 WAV/MP3 交付到 output/修音成品，命名为 修音版_原名，重名时递增 _01/_02。
+description: 仓库级中文总技能。用于中文口播、课程讲解、配音、旁白、批量音频整理、删词剪辑与交付。默认按 auto 执行 Best Repair：先建立 natural 安全基线，再强制竞争 final_repair_best，并仅按缺陷证据启用固定安全候选。涉及删词时必须先做语音边界收口与音画同步验证，并把最终 WAV/MP3 交付到 output/修音成品，命名为 修音版_原名，重名时递增 _01/_02。
 ---
 
 # audio-sound
@@ -28,7 +28,7 @@ description: 仓库级中文总技能。用于中文口播、课程讲解、配�
   - 要同文件噪声窗口隔离：`voice-isolate`
   - 要审查标记和复核报告：`review`
 
-除非用户明确要求快速预览，否则不要把 `scripts/audio_cleanup.py clean` 当成最终交付入口。最终交付优先用 `scripts/audio_skill_workflow.py run ...`。
+除非用户明确要求快速预览，否则不要把 `scripts/audio_cleanup.py clean` 当成最终交付入口。Windows 最终交付优先用 `run_audio_workflow.cmd ...`；直接运行 Python 时必须显式使用仓库 `.venv\Scripts\python.exe`。
 
 如果用户要求降噪、呼吸音、气口、口水音、清晰度 EQ、人声增强、“最终修复版”，或者反馈上一版听起来几乎没区别，不能停在只做高通、轻压缩和响度统一且未通过增强候选的结果。优先依赖 `auto` 的 `final_repair_best`，或直接 `--mode final`；确认报告含 `capability_plan`、`repair_scorecard` 且真实应用了修复阶段。只有响度或峰值变化、没有实际修复阶段的结果不算完成。
 

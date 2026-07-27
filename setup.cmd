@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 set "PATH=%~dp0ffmpeg\bin;%PATH%"
 if not exist ".venv\Scripts\python.exe" (

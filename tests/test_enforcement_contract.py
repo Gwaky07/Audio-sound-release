@@ -32,6 +32,7 @@ REQUIRED_GUARD_FAILURE_CODES = frozenset(
         "source_active_hard_mute",
         "spectral_clarity_lost",
         "spectral_harshness_increased",
+        "pre_speech_soft_noise_boosted",
     }
 )
 

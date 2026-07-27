@@ -2,22 +2,22 @@
 
 ## 1. 先做环境核查
 
-```bash
-python ../../../scripts/audio_cleanup.py doctor
+```powershell
+doctor.cmd
 ```
 
 ## 2. 查看可用 workflow 模式
 
-```bash
-python ../../../scripts/audio_skill_workflow.py describe-modes
+```powershell
+.\.venv\Scripts\audio-skill-workflow.exe describe-modes
 ```
 
 ## 3. 默认自动优选模式
 
 这是本 skill 的默认最终交付入口：
 
-```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>"
+```powershell
+run_audio_workflow.cmd "<输入音频>"
 ```
 
 等价于 `--mode auto`：先跑 `natural` 基线，再按诊断尝试白名单增强候选；全部硬守门通过才自动交付，否则回退自然版。
@@ -25,8 +25,8 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>"
 最终音频默认只看：
 
 ```text
-../../../output/修音成品/修音版_<原音频文件名>.wav
-../../../output/修音成品/修音版_<原音频文件名>.mp3
+output/修音成品/修音版_<原音频文件名>.wav
+output/修音成品/修音版_<原音频文件名>.mp3
 ```
 
 如果同名已存在，会自动生成 `_01`、`_02`。中间 wav/mp3 默认清理掉，只保留报告和频谱证据。
@@ -37,44 +37,44 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>"
 
 可选双 ASR 证据：
 
-```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --source-asr source-a.json --source-asr source-b.json --candidate-asr cand-a.json --candidate-asr cand-b.json
+```powershell
+run_audio_workflow.cmd "<输入音频>" --source-asr source-a.json --source-asr source-b.json --candidate-asr cand-a.json --candidate-asr cand-b.json
 ```
 
 清晰度候选和双模型组合缺少可绑定 ASR 证据时只能回退 `natural`；单模型候选无 ASR 时必须通过更严格的衰减、频谱和局部相关性守门。ASR 冲突转人工复核。
 
 如果要排查阶段问题，才保留中间音频：
 
-```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --keep-intermediate-audio
+```powershell
+run_audio_workflow.cmd "<输入音频>" --keep-intermediate-audio
 ```
 
 同源前后对比回归：
 
-```bash
-python ../../../scripts/evaluate_audio_pair.py --source "<原音>" --processed "<成品>" --output "../../../scratch/pair-report.json"
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_audio_pair.py --source "<原音>" --processed "<成品>" --output "scratch\pair-report.json"
 ```
 
 ## 4. 旧版呼吸清理风格
 
-```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode reference-style
+```powershell
+run_audio_workflow.cmd "<输入音频>" --mode reference-style
+```
 
 `reference-legacy` 仅用于明确要求复现旧交付或问题对照，不得作为新成品默认模式。
-```
 
 ## 5. 带局部频谱窗口的运行方式
 
 当你已经知道要重点看哪些节点时：
 
-```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --focus-window 节点A,234.8,1.4 --focus-window 节点B,530.3,1.1
+```powershell
+run_audio_workflow.cmd "<输入音频>" --focus-window 节点A,234.8,1.4 --focus-window 节点B,530.3,1.1
 ```
 
 排查“开头突然多出来声音”和“某个字断开/吞字”时，必须带 focus-window：
 
-```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --focus-window start_artifact_1s,0.75,0.9 --focus-window zishi_12s,11.65,1.25
+```powershell
+run_audio_workflow.cmd "<输入音频>" --focus-window start_artifact_1s,0.75,0.9 --focus-window zishi_12s,11.65,1.25
 ```
 
 运行后重点检查：
@@ -87,22 +87,22 @@ python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --focus-win
 
 ## 6. 同文件噪声窗口驱动的隔离模式
 
-```bash
-python ../../../scripts/audio_skill_workflow.py run "<输入音频>" --mode voice-isolate --noise-window 143.089208:144.093687 --noise-window 161.583729:169.578792
+```powershell
+run_audio_workflow.cmd "<输入音频>" --mode voice-isolate --noise-window 143.089208:144.093687 --noise-window 161.583729:169.578792
 ```
 
 ## 7. 精确节点补修
 
 当主流程做完后，仍有少量明确时间点残留时，用这个脚本直接修最终 WAV。
 
-```bash
-python ../../../scripts/exact_window_cleanup.py "<基底WAV>" --output "<新WAV>" --report "<报告JSON>" --mute-window 235.466,235.785 --mute-window 530.828,531.008
+```powershell
+.\.venv\Scripts\python.exe scripts\exact_window_cleanup.py "<基底WAV>" --output "<新WAV>" --report "<报告JSON>" --mute-window 235.466,235.785 --mute-window 530.828,531.008
 ```
 
 如果不能整段硬静音，而是要轻一点压低：
 
-```bash
-python ../../../scripts/exact_window_cleanup.py "<基底WAV>" --output "<新WAV>" --report "<报告JSON>" --duck-window 235.466,235.785,0.12,8
+```powershell
+.\.venv\Scripts\python.exe scripts\exact_window_cleanup.py "<基底WAV>" --output "<新WAV>" --report "<报告JSON>" --duck-window 235.466,235.785,0.12,8
 ```
 
 说明：
@@ -119,7 +119,7 @@ ffmpeg -y -hide_banner -nostdin -i "<新WAV>" -codec:a libmp3lame -q:a 2 "<新MP
 ## 9. 单独做窄起字前清理
 
 ```bash
-python ../../../scripts/narrow_onset_cleanup.py "<输入WAV>" --output "<输出WAV>" --report "<报告JSON>"
+.\.venv\Scripts\python.exe scripts\narrow_onset_cleanup.py "<输入WAV>" --output "<输出WAV>" --report "<报告JSON>"
 ```
 
 这个脚本适合做起字前的窄窗口清理，但如果用户已经明确点名具体时间点，优先直接做 `exact_window_cleanup.py`。
@@ -167,13 +167,13 @@ for label, path in files.items():
 单个文件：
 
 ```bash
-python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run "<输入视频或音频>" --cut "0.62,1.82" --removed-phrase "啊说德语啊"
 ```
 
 如果删完仍有“边界残留”“接缝杂音”，先复核局部频谱和报告中的实际 `cuts`，不要直接拉长淡化。若两个保留句子续接过急，使用语音安全接缝：
 
 ```bash
-python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "0.62,1.82" --removed-phrase "啊说德语啊" --seam-pause-ms 80
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run "<输入视频或音频>" --cut "0.62,1.82" --removed-phrase "啊说德语啊" --seam-pause-ms 80
 ```
 
 `--seam-pause-ms 60–100` 会让前句淡出、冻结视频上一帧、短暂停顿后再淡入下一句；它适合“卡一下”“突然接上一个字”，不应对所有删词默认启用。
@@ -181,19 +181,19 @@ python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" 
 尾段删除时，结束时间留空：
 
 ```bash
-python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "4.40," --removed-phrase "是不是"
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run "<输入视频或音频>" --cut "4.40," --removed-phrase "是不是"
 ```
 
 同一个文件删多个位置时，重复 `--cut`：
 
 ```bash
-python ../../../scripts/remove_spoken_segments.py run "<输入视频或音频>" --cut "0.00,1.80" --cut "2.10,2.34" --cut "4.40," --removed-phrase "你看，那个，是，是不是"
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run "<输入视频或音频>" --cut "0.00,1.80" --cut "2.10,2.34" --cut "4.40," --removed-phrase "你看，那个，是，是不是"
 ```
 
 批量处理用 JSON：
 
 ```bash
-python ../../../scripts/remove_spoken_segments.py run-batch jobs.json
+.\.venv\Scripts\python.exe scripts\remove_spoken_segments.py run-batch jobs.json
 ```
 
 `jobs.json` 示例：
@@ -224,9 +224,9 @@ python ../../../scripts/remove_spoken_segments.py run-batch jobs.json
 输出仍然只看：
 
 ```text
-../../../output/修音成品/修音版_<原文件名>.wav
-../../../output/修音成品/修音版_<原文件名>.mp3
-../../../output/修音成品/修音版_<原文件名>.mp4
+output/修音成品/修音版_<原文件名>.wav
+output/修音成品/修音版_<原文件名>.mp3
+output/修音成品/修音版_<原文件名>.mp4
 ```
 
 这个脚本不调用 Respiro-en 或 DeepFilterNet；报告里会明确记录它们未使用。它适合“明确给了时间点、要真正删掉文字”的场景，不替代默认的整体修音 workflow。
@@ -236,7 +236,7 @@ python ../../../scripts/remove_spoken_segments.py run-batch jobs.json
 凡是文档红字、重复口播、同音相邻词，或用户报告“最终视频某时间仍有目标词”，上传前必须运行发布审计：
 
 ```powershell
-python ../../../scripts/audit_spoken_release.py run `
+.\.venv\Scripts\python.exe scripts\audit_spoken_release.py run `
   --requirements "<要求映射.json>" `
   --source-asr "<原片ASR-1.json>" `
   --source-asr "<原片ASR-2.json>" `

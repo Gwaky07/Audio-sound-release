@@ -156,6 +156,23 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(cleaned[:120], samples[:120])
         self.assertEqual(cleaned[220:], samples[220:])
 
+    def test_pre_speech_soft_noise_boost_guard_flags_loudnorm_pump(self) -> None:
+        from audio_sound.pipeline import detect_pre_speech_soft_noise_boost_windows
+
+        reference = array("h", [0] * 1000 + [300] * 500 + [9000] * 1000)
+        processed = array("h", [0] * 1000 + [12000] * 500 + [9000] * 1000)
+        windows = detect_pre_speech_soft_noise_boost_windows(
+            reference,
+            processed,
+            sample_rate=1000,
+            frame_ms=20.0,
+            max_boost_db=12.0,
+            hold_pad_ms=50.0,
+            min_duration_ms=40.0,
+        )
+        self.assertTrue(windows)
+        self.assertLess(windows[0]["start_seconds"], 1.6)
+
     def test_adaptive_cleanup_can_target_measured_global_noise_floor(self) -> None:
         samples = array("h", [2000] * 100)
 
@@ -889,17 +906,17 @@ class PipelineTests(unittest.TestCase):
     def test_build_output_layout_preserves_unicode_source_name_for_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_root = Path(tmp_dir) / "output"
-            source = Path("C:/Users/Guanghe/Downloads/?????????-??.wav")
+            source = Path("C:/Users/TestUser/Downloads/中文口播-测试.wav")
             layout = build_output_layout(
                 input_path=source,
                 output_root=output_root,
                 run_slug="20260527-120000",
             )
 
-            self.assertEqual(layout.job_name, "20260527-120000_?????????-??")
-            self.assertEqual(layout.raw_wav.name, "?????????-??_raw.wav")
-            self.assertEqual(layout.clean_wav.name, "?????????-??_clean.wav")
-            self.assertEqual(layout.transcript_mp3.name, "?????????-??_transcript.mp3")
+            self.assertEqual(layout.job_name, "20260527-120000_中文口播-测试")
+            self.assertEqual(layout.raw_wav.name, "中文口播-测试_raw.wav")
+            self.assertEqual(layout.clean_wav.name, "中文口播-测试_clean.wav")
+            self.assertEqual(layout.transcript_mp3.name, "中文口播-测试_transcript.mp3")
 
     def test_build_ffmpeg_extract_command_uses_preset_values(self) -> None:
         preset = load_preset("safe")

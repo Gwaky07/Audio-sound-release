@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from .console import configure_utf8_stdio
 from .config import PROJECT_ROOT, load_env_file, resolve_binary
 from .media_utils import export_mp3, format_seconds as _format_seconds
 from .skill_workflow import _safe_windows_stem
@@ -946,6 +947,7 @@ def run_jobs(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     env_values = load_env_file(args.env)

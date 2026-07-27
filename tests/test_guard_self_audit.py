@@ -210,6 +210,24 @@ class InjectedDamageDetectionTests(unittest.TestCase):
         self.assertIn("source_active_hard_mute", guard["failures"])
         self.assertGreaterEqual(len(guard["hard_mute_windows"]), 1)
 
+    def test_pre_speech_soft_noise_boost_is_detected(self) -> None:
+        """loudnorm-style pump of quiet leading ambience must block release."""
+        reference = _speech_like_samples()
+        processed = array("h", reference)
+        # Speech onset is ~0.15s; amplify the quiet leading region only.
+        end = int(0.10 * SAMPLE_RATE)
+        for index in range(end):
+            processed[index] = int(
+                max(-32768, min(32767, round(reference[index] * 40.0)))
+            )
+
+        guard = _guard(reference, processed, sample_level=True)
+
+        self.assertEqual(guard["status"], "FAIL")
+        self.assertTrue(guard["release_blocked"])
+        self.assertIn("pre_speech_soft_noise_boosted", guard["failures"])
+        self.assertGreaterEqual(len(guard["pre_speech_boost_windows"]), 1)
+
     def test_sample_rate_change_is_detected(self) -> None:
         reference = _speech_like_samples()
 

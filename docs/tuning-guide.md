@@ -34,8 +34,8 @@ If word tails are being clipped:
 
 Override integrated loudness with:
 
-```bash
-python scripts/audio_cleanup.py process "<input>" --target-lufs -14
+```powershell
+.\.venv\Scripts\python.exe scripts\audio_cleanup.py clean "<input>" --target-lufs -14
 ```
 
 ### Review markers
@@ -54,4 +54,3 @@ Those values live in `presets/review.json`.
 3. Compare reports and listening results.
 4. Tune preset JSON, not ad hoc shell commands.
 5. Keep one preset change per iteration so regressions stay obvious.
-
