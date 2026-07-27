@@ -61,28 +61,22 @@ def evaluate_audio_pair(
     processed_meta = ffprobe_media(processed, ffprobe_bin)
     with tempfile.TemporaryDirectory(prefix="audio-pair-") as tmp_dir:
         root = Path(tmp_dir)
-        source_wav = source if source.suffix.lower() == ".wav" else root / "source.wav"
-        processed_wav = (
-            processed if processed.suffix.lower() == ".wav" else root / "processed.wav"
+        source_wav = _extract_pcm_wav(
+            source,
+            root / "source.wav",
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            sample_rate=source_meta.get("sample_rate"),
+            channels=source_meta.get("channels"),
         )
-        if source_wav != source:
-            _extract_pcm_wav(
-                source,
-                source_wav,
-                ffmpeg_bin=ffmpeg_bin,
-                ffprobe_bin=ffprobe_bin,
-                sample_rate=source_meta.get("sample_rate"),
-                channels=source_meta.get("channels"),
-            )
-        if processed_wav != processed:
-            _extract_pcm_wav(
-                processed,
-                processed_wav,
-                ffmpeg_bin=ffmpeg_bin,
-                ffprobe_bin=ffprobe_bin,
-                sample_rate=processed_meta.get("sample_rate"),
-                channels=processed_meta.get("channels"),
-            )
+        processed_wav = _extract_pcm_wav(
+            processed,
+            root / "processed.wav",
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            sample_rate=processed_meta.get("sample_rate"),
+            channels=processed_meta.get("channels"),
+        )
         reference_params, reference_samples = _load_wave_samples(source_wav)
         processed_params, processed_samples = _load_wave_samples(processed_wav)
         reference_mono = _analysis_samples(reference_params, reference_samples)

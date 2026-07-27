@@ -670,24 +670,36 @@ def detect_first_speech_onset_seconds(
 
 
 def seal_leading_pre_speech_noise(
-    samples: array,
+    reference_samples: array,
+    processed_samples: array,
     *,
     sample_rate: int,
     channels: int,
-    speech_onset_seconds: float | None,
     hold_pad_ms: float = 45.0,
     silence_floor_dbfs: float = -96.0,
     fade_ms: float = 12.0,
     max_attenuation_db: float = 60.0,
-    min_seal_seconds: float = 0.05,
+    source_quiet_dbfs: float = -40.0,
+    processed_audible_dbfs: float = -55.0,
+    max_boost_db: float = 12.0,
+    min_duration_ms: float = 40.0,
+    source_analysis: dict[str, Any] | None = None,
 ) -> tuple[array, dict[str, Any]]:
-    """Duck leading soft noise before first source-active speech onset.
+    """Duck only evidenced leading noise boosted above its source level.
 
-    Evidence is the source active-speech onset (same threshold as hard-mute
-    preservation), not an unconditional whole-file mute. This prevents
-    mastering/`loudnorm` dynamic makeup from turning quiet pre-speech
-    breath/ambience into an audible boom without swallowing retained onsets.
+    A source-speech onset alone does not authorize muting the whole prefix.
+    Candidates must be quiet in the immutable source, audibly raised in the
+    processed media, and clipped against the source active-speech guard.
     """
+    reference_mono = _downmix_interleaved_samples(reference_samples, channels)
+    processed_mono = _downmix_interleaved_samples(processed_samples, channels)
+    speech_onset_seconds = detect_first_speech_onset_seconds(
+        reference_mono,
+        sample_rate=sample_rate,
+        channels=1,
+        threshold_dbfs=-35.0,
+        min_hold_ms=50.0,
+    )
     report: dict[str, Any] = {
         "status": "SKIP",
         "speech_onset_seconds": (
@@ -696,18 +708,59 @@ def seal_leading_pre_speech_noise(
         "sealed_end_seconds": None,
         "hold_pad_ms": round(float(hold_pad_ms), 3),
         "silence_floor_dbfs": round(float(silence_floor_dbfs), 3),
+        "guard_exclusion_allowed": False,
+        "candidate_windows": [],
+        "applied_windows": [],
+        "rejected_windows": [],
         "details": [],
     }
     if speech_onset_seconds is None:
         report["reason"] = "speech_onset_unavailable"
-        return array("h", samples), report
-    sealed_end = float(speech_onset_seconds) - (float(hold_pad_ms) / 1000.0)
-    if sealed_end < float(min_seal_seconds):
-        report["reason"] = "seal_region_too_short"
-        return array("h", samples), report
+        return array("h", processed_samples), report
+    candidates = detect_pre_speech_soft_noise_boost_windows(
+        reference_mono,
+        processed_mono,
+        sample_rate=sample_rate,
+        source_quiet_dbfs=source_quiet_dbfs,
+        processed_audible_dbfs=processed_audible_dbfs,
+        max_boost_db=max_boost_db,
+        hold_pad_ms=hold_pad_ms,
+        min_duration_ms=min_duration_ms,
+    )
+    report["candidate_windows"] = candidates
+    if not candidates:
+        report["reason"] = "no_boosted_pre_speech_noise"
+        return array("h", processed_samples), report
+    resolved_source_analysis = source_analysis or analyze_pcm16_samples(
+        reference_mono,
+        sample_rate=sample_rate,
+    )
+    safe_windows: list[NoiseWindow] = []
+    for item in candidates:
+        candidate = NoiseWindow(
+            start_seconds=float(item["start_seconds"]),
+            end_seconds=float(item["end_seconds"]),
+        )
+        safe_window = _clip_window_before_active_speech(
+            candidate,
+            resolved_source_analysis,
+        )
+        if safe_window is None:
+            report["rejected_windows"].append(
+                {
+                    "start_seconds": candidate.start_seconds,
+                    "end_seconds": candidate.end_seconds,
+                    "reason": "source_active_speech_protected",
+                }
+            )
+            continue
+        safe_windows.append(safe_window)
+    if not safe_windows:
+        report["reason"] = "all_candidates_rejected_by_speech_guard"
+        return array("h", processed_samples), report
     cleaned, details = apply_adaptive_breath_cleanup(
-        samples,
-        windows=[NoiseWindow(0.0, sealed_end)],
+        processed_samples,
+        windows=safe_windows,
         sample_rate=sample_rate,
         channels=channels,
         max_attenuation_db=float(max_attenuation_db),
@@ -716,8 +769,21 @@ def seal_leading_pre_speech_noise(
         fade_ms=float(fade_ms),
         target_dbfs_override=float(silence_floor_dbfs),
     )
+    if cleaned == processed_samples:
+        report["reason"] = "no_attenuation_required"
+        return cleaned, report
     report["status"] = "PASS"
-    report["sealed_end_seconds"] = round(sealed_end, 6)
+    report["sealed_end_seconds"] = round(
+        max(window.end_seconds for window in safe_windows),
+        6,
+    )
+    report["applied_windows"] = [
+        {
+            "start_seconds": window.start_seconds,
+            "end_seconds": window.end_seconds,
+        }
+        for window in safe_windows
+    ]
     report["details"] = details
     return cleaned, report
 
@@ -2973,32 +3039,37 @@ def _run_leading_pre_speech_seal(
     report: dict[str, Any],
     report_key: str,
     stage: str,
+    source_analysis: dict[str, Any] | None = None,
     hold_pad_ms: float = 45.0,
     silence_floor_dbfs: float = -96.0,
     fade_ms: float = 12.0,
-) -> NoiseWindow | None:
-    """Seal leading soft noise using source-active speech onset evidence."""
+) -> bool:
+    """Seal only measured post-processing boosts in pre-speech soft noise."""
     if not target_wav.exists() or not raw_wav.exists():
         report[report_key] = {
             "status": "SKIP",
             "stage": stage,
             "reason": "seal_inputs_missing",
         }
-        return None
+        return False
     onset_params, onset_samples = _load_wave_samples(raw_wav)
-    speech_onset = detect_first_speech_onset_seconds(
-        onset_samples,
-        sample_rate=onset_params.framerate,
-        channels=onset_params.nchannels,
-        threshold_dbfs=-35.0,
-        min_hold_ms=50.0,
-    )
     target_params, target_samples = _load_wave_samples(target_wav)
+    if (
+        target_params.framerate != onset_params.framerate
+        or target_params.nchannels != onset_params.nchannels
+    ):
+        report[report_key] = {
+            "status": "SKIP",
+            "stage": stage,
+            "reason": "seal_format_mismatch",
+        }
+        return False
     sealed_samples, seal_report = seal_leading_pre_speech_noise(
+        onset_samples,
         target_samples,
         sample_rate=target_params.framerate,
         channels=target_params.nchannels,
-        speech_onset_seconds=speech_onset,
+        source_analysis=source_analysis,
         hold_pad_ms=hold_pad_ms,
         silence_floor_dbfs=silence_floor_dbfs,
         fade_ms=fade_ms,
@@ -3008,17 +3079,9 @@ def _run_leading_pre_speech_seal(
         **seal_report,
     }
     if seal_report.get("status") != "PASS" or sealed_samples == target_samples:
-        return None
+        return False
     _write_wave_samples(target_wav, target_params, sealed_samples)
-    sealed_end = seal_report.get("sealed_end_seconds")
-    if sealed_end is None:
-        return None
-    authorized = NoiseWindow(0.0, float(sealed_end))
-    report[report_key]["authorized_window"] = {
-        "start_seconds": authorized.start_seconds,
-        "end_seconds": authorized.end_seconds,
-    }
-    return authorized
+    return True
 
 
 def _run_pause_cleanup(
@@ -4007,16 +4070,12 @@ def process_media_file(
         report["spectramini_applied"] = samples_changed
         report["stage_status"]["spectramini"]["applied"] = samples_changed
 
-    # Seal quiet leading noise before mastering so loudnorm dynamic cannot
-    # amplify pre-speech breath/ambience into an audible boom. Onset evidence
-    # always comes from immutable raw_wav active-speech detection.
-    _run_leading_pre_speech_seal(
-        target_wav=layout.breath_wav,
-        raw_wav=layout.raw_wav,
-        report=report,
-        report_key="leading_pre_speech_seal",
-        stage="pre_mastering",
-    )
+    report["leading_pre_speech_seal"] = {
+        "stage": "pre_mastering",
+        "status": "SKIP",
+        "reason": "deferred_to_post_mastering_difference_evidence",
+        "guard_exclusion_allowed": False,
+    }
 
     if apply_deepfilternet:
         deepfilter_command = commands[1]
@@ -4064,11 +4123,6 @@ def process_media_file(
         commands=commands,
         executed=executed,
     )
-    leading_seal = report.get("leading_pre_speech_seal") or {}
-    if leading_seal.get("status") == "PASS" and leading_seal.get("sealed_end_seconds") is not None:
-        authorized_cleanup_windows.append(
-            NoiseWindow(0.0, float(leading_seal["sealed_end_seconds"]))
-        )
     breath_onset_cleanup = preset.get("filters", {}).get("breath_onset_cleanup", {})
     if breath_onset_cleanup.get("enabled"):
         breath_windows = detect_breath_onset_windows(
@@ -4101,15 +4155,15 @@ def process_media_file(
         executed=executed,
     )
 
-    post_seal_window = _run_leading_pre_speech_seal(
+    post_seal_applied = _run_leading_pre_speech_seal(
         target_wav=layout.clean_wav,
         raw_wav=layout.raw_wav,
         report=report,
         report_key="leading_pre_speech_seal_post",
         stage="post_mastering",
+        source_analysis=input_analysis,
     )
-    if post_seal_window is not None:
-        authorized_cleanup_windows.append(post_seal_window)
+    if post_seal_applied:
         _run_recorded_command(commands[-1], executed)
 
     report["executed"] = executed

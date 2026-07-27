@@ -156,41 +156,84 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(cleaned[:120], samples[:120])
         self.assertEqual(cleaned[220:], samples[220:])
 
-    def test_leading_pre_speech_seal_ducks_soft_noise_before_onset(self) -> None:
-        from audio_sound.pipeline import (
-            detect_first_speech_onset_seconds,
-            seal_leading_pre_speech_noise,
-        )
+    def test_leading_pre_speech_seal_only_ducks_evidenced_boost(self) -> None:
+        from audio_sound.pipeline import seal_leading_pre_speech_noise
 
         silence = array("h", [0] * 1000)
-        soft = array("h", [400] * 500)  # quiet pre-speech noise
+        soft = array("h", [300] * 500)  # quiet pre-speech noise
         speech = array("h", [8000] * 1000)
-        samples = array("h")
-        samples.extend(silence)
-        samples.extend(soft)
-        samples.extend(speech)
-        onset = detect_first_speech_onset_seconds(
-            samples,
-            sample_rate=1000,
-            channels=1,
-            threshold_dbfs=-35.0,
-            min_hold_ms=40.0,
-        )
-        self.assertIsNotNone(onset)
-        assert onset is not None
-        self.assertGreaterEqual(onset, 1.4)
+        reference = array("h", [*silence, *soft, *speech])
+        processed = array("h", reference)
+        processed[1000:1500] = array("h", [12000] * 500)
         sealed, report = seal_leading_pre_speech_noise(
-            samples,
+            reference,
+            processed,
             sample_rate=1000,
             channels=1,
-            speech_onset_seconds=onset,
             hold_pad_ms=50.0,
             silence_floor_dbfs=-96.0,
             fade_ms=0.0,
         )
         self.assertEqual(report["status"], "PASS")
-        self.assertLess(max(abs(value) for value in sealed[1000:1450]), 30)
-        self.assertEqual(sealed[1600:], samples[1600:])
+        self.assertFalse(report["guard_exclusion_allowed"])
+        self.assertEqual(
+            report["applied_windows"],
+            [{"start_seconds": 1.0, "end_seconds": 1.44}],
+        )
+        self.assertLess(max(abs(value) for value in sealed[1000:1440]), 30)
+        self.assertEqual(sealed[:1000], processed[:1000])
+        self.assertEqual(sealed[1440:], processed[1440:])
+
+    def test_leading_pre_speech_seal_preserves_unboosted_prefix(self) -> None:
+        from audio_sound.pipeline import seal_leading_pre_speech_noise
+
+        reference = array("h", [300] * 1500 + [8000] * 1000)
+        sealed, report = seal_leading_pre_speech_noise(
+            reference,
+            array("h", reference),
+            sample_rate=1000,
+            channels=1,
+            hold_pad_ms=50.0,
+            silence_floor_dbfs=-96.0,
+            fade_ms=0.0,
+        )
+
+        self.assertEqual(report["status"], "SKIP")
+        self.assertEqual(report["reason"], "no_boosted_pre_speech_noise")
+        self.assertEqual(sealed, reference)
+
+    def test_leading_pre_speech_seal_preserves_stereo_frame_layout(self) -> None:
+        from audio_sound.pipeline import seal_leading_pre_speech_noise
+
+        reference = array("h")
+        processed = array("h")
+        for frame_index in range(2500):
+            if frame_index < 1000:
+                source_frame = (0, 0)
+                processed_frame = source_frame
+            elif frame_index < 1500:
+                source_frame = (300, 300)
+                processed_frame = (12000, 12000)
+            else:
+                source_frame = (8000, 8000)
+                processed_frame = source_frame
+            reference.extend(source_frame)
+            processed.extend(processed_frame)
+
+        sealed, report = seal_leading_pre_speech_noise(
+            reference,
+            processed,
+            sample_rate=1000,
+            channels=2,
+            hold_pad_ms=50.0,
+            silence_floor_dbfs=-96.0,
+            fade_ms=0.0,
+        )
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(len(sealed), len(processed))
+        self.assertLess(max(abs(value) for value in sealed[2000:2880]), 30)
+        self.assertEqual(sealed[2880:], processed[2880:])
 
     def test_pre_speech_soft_noise_boost_guard_flags_loudnorm_pump(self) -> None:
         from audio_sound.pipeline import detect_pre_speech_soft_noise_boost_windows

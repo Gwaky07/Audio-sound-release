@@ -2,6 +2,8 @@
 
 GitHub 的 clean-source 分享包只包含仓库源码、Codex skill 和配置文件，不包含 Python 虚拟环境、`ffmpeg/`、`tools/`、模型权重或任何用户音频。
 
+在已安装 Python 3.11/3.10 和 FFmpeg 的 Windows 机器上，接收者解压后直接用 Codex 打开该目录即可；把音频拖入并说“处理这个音频”即可，无需另行解释修音规则。仓库内的 `AGENTS.md` 与 `audio-sound` skill 会让 Codex 自动执行运行时检查、必要安装、Best Repair 工作流和最终交付。首次使用仍需要联网安装 Python 依赖；缺少 Python 或 FFmpeg 时必须先按下方步骤准备。
+
 在接收端 Windows 机器上：
 
 1. 安装 Python 3.11 或 3.10。Python 3.12 及以上版本不受支持。

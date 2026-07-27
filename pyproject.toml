@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audio-sound"
-version = "0.5.0"
+version = "0.5.1"
 description = "Standalone Codex-triggered audio processing pipeline."
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
@@ -22,3 +22,7 @@ packages = ["audio_sound", "audio_sound.presets"]
 
 [tool.setuptools.package-data]
 "audio_sound.presets" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".git", ".venv", "output", "scratch", "tools"]
