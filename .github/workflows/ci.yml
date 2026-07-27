@@ -309,3 +309,4 @@ jobs:
           $result = Get-Content $out -Raw | ConvertFrom-Json
           if (-not $result.release_blocked) { throw "missing final WAV left release_blocked false" }
           Write-Host "blocked as expected: missing final WAV"
+          exit 0
