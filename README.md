@@ -1,22 +1,55 @@
 # Audio-sound
 
-`Audio-sound` 是一个面向中文口播、课程讲解、旁白和访谈音频的 Windows 本地音频清理工作流仓库。
+[![CI](https://github.com/Gwaky07/Audio-sound-release/actions/workflows/ci.yml/badge.svg)](https://github.com/Gwaky07/Audio-sound-release/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Gwaky07/Audio-sound-release?label=release)](https://github.com/Gwaky07/Audio-sound-release/releases/latest)
+![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4)
+[![License](https://img.shields.io/github/license/Gwaky07/Audio-sound-release)](LICENSE)
 
-它的目标不是追求绝对安静，而是在自然度、清晰度和稳定性优先的前提下，让 Codex 或人工操作者得到可交付成品，并对已确认的噪声、呼吸、口水音、停顿残留和删词接缝做可复核处理。
+面向中文口播、课程讲解、旁白和访谈的 Windows 本地工作流：**修音降噪、删字删话、接缝修复、质量守门和 WAV/MP3 交付**。
 
+它不以“波形看起来绝对安静”为目标，而是在保护字头、字尾、声道布局和原声自然度的前提下，处理呼吸、口水音、齿音、底噪、音量不稳、片头轰鸣、重复字、口误、废句与剪辑接缝。
 
+> 当前推荐版本：[`v0.5.1`](https://github.com/Gwaky07/Audio-sound-release/releases/tag/v0.5.1)。`v0.5.0` 存在片头短字保护缺陷，请勿使用。
+
+**[下载最新版](https://github.com/Gwaky07/Audio-sound-release/releases/latest)** ·
+**[快速安装](RELEASE_QUICK_START.md)** ·
+**[架构说明](docs/architecture.md)** ·
+**[调参指南](docs/tuning-guide.md)**
+
+![Audio-sound 工作流概览](docs/assets/workflow-overview.svg)
+
+## 核心能力
+
+- **完整修音**：按证据处理呼吸、停顿残留和底噪，并应用清晰度 EQ、轻去齿音、温和压缩、稳量与响度标准化。
+- **删字删话**：物理删除口误、重复字、废句或指定时间段，支持音频与视频同步剪辑。
+- **接缝修复**：边界搜索、短交叉淡化和语音安全停顿，减少残留半个音节、爆点和“突然接上下一句”。
+- **声道与格式保护**：默认保留采样率、声道数和立体声布局；左右耳不一致时可安全生成 dual-mono 立体声。
+- **发布质量守门**：检查吞字、硬静音、频谱清晰度、刺耳增益、短时增益波动、格式变化和模型真实收益。
+- **可复核交付**：生成 WAV、MP3、处理报告、频谱证据、独立 pair guard 与 SHA-256 绑定的验证清单。
+
+## 三步开始
+
+```powershell
+setup.cmd
+doctor.cmd
+run_audio_workflow.cmd "D:\audio\中文口播.wav"
+```
+
+成品默认进入 `output/修音成品/`。明确修音需求会按 Best Repair 竞争固定安全候选；增强未通过守门时不会伪装成已修复完成。
 
 ## 效果展示
 
-> 说明：仓库中不提交客户原始音视频或成品音视频。下面的图是公开安全的波形示意，用来说明本仓库重点解决的“边界残留 / 接缝杂音 / 刺音爆点”问题。真实项目的成品音视频建议放在飞书文档或 GitHub Releases 的 Assets 中。
+> 仓库不提交客户原始音视频或交付成品。以下图片仅保留公开安全的波形与频谱证据。
 
 ![修音前后对比示意](docs/assets/before-after-waveform.svg)
 
-真实处理证据示例：下图来自一次已完成修音任务的频谱/波形复核图，已裁掉文件说明，仅保留“处理前/处理后”的声学证据。
+真实处理证据示例：下图来自已完成任务的固定刻度频谱/波形复核图，展示多个局部窗口的处理前后差异。
 
 ![真实频谱与波形修复对比](docs/assets/spectrum-before-after.jpg)
 
 典型处理效果：
+
 - 删除重复字、口误、废句后，避免残留半个音节。
 - 对接缝使用短交叉淡化或安全停顿，减少“突然接上下一句”的卡顿感。
 - 对刺耳瞬态、爆点、齿音进行窄窗口压制，尽量不伤正常人声。
@@ -117,6 +150,8 @@ run_audio_workflow.cmd "D:\audio\raw-voice.wav"
 当使用 `final` 处理明确的呼吸音或停顿杂音时，原始 `raw_wav` 不再被原地改写。工作流会融合 Respiro、辅助停顿边缘和噪声型频谱证据，只在语音起点前的授权窗口内按附近底噪自适应处理；母带后继续复检和窄窗口补处理。报告中 `breath_cleanup.status=PASS` 且 `final_residual_windows` 为空才允许交付。preservation 守门仅排除这些有证据的授权窗口，不会放宽其余语音区域。
 
 `final` 也会对确认静音内部的过渡底噪做语音安全 AutoGate 等价清理：两侧保留安全边界（句间约 45 ms，片头/片尾约 25 ms），确认无声核心目标为 `silence_floor_dbfs=-96`，必要时执行多轮窄窗口衰减。该阶段不会启用全局 Dynamics Gate / `agate` 或无证据数字硬静音；`pause_cleanup.status=PASS`、`mode=speech_safe_autogate`、空残留列表和固定刻度局部频谱（中间接近黑色）共同构成交付证据。
+
+从 `v0.5.1` 起，片头轻噪声修复只在母带后比较不可变原音与真实成品：只有同时满足“源音安静、成品达到可闻电平、增益异常升高”的具体窗口才会处理。片头短字、轻声和字尾仍受源活跃语音保护，相关窗口不进入质量守门排除列表，因此不能用清理授权掩盖吞字。
 
 只想跑自然基线时：
 
